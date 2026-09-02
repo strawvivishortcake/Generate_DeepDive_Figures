@@ -2,7 +2,7 @@
 """Synthetic PDAC deep-dive figure pipeline for educational and research prototyping.
 
 This script extends the existing synthetic glioma cohort by creating a focused
-IDH-wildtype PDAC analysis. It generates synthetic bulk RNA-expression data,
+Pancreatic Adenocarcinoma (PDAC) analysis. It generates synthetic bulk RNA-expression data,
 classifies tumors into transcriptional subtype groups, validates the synthetic
 classification against hidden generator labels, and produces a comprehensive set
 of figures and result tables.
@@ -87,21 +87,21 @@ REQUIRED_COLUMNS = [
     "SAMPLE_TYPE",
     "KRAS_mut",
     "TP53_mut",
-    "CDKN2A_mut",
-    "CDKN2B_mut",
-    "SMAD4_mut",
-    "ARID1A_amp",
-    "RNF43_del",
-    "GNAS_del",
-    "BRCA1_del",
+    "CDKN2A_del",
+    "CDKN2B_del",
+    "SMAD4_del",
+    "ARID1A_mut",
+    "RNF43_mut",
+    "GNAS_mut",
+    "BRCA1_mut",
     "BRCA2_mut",
     "PALB2_mut",
     "STK11_mut",
     "TGFBR2_mut",
     "MYC_amp",
-    "ERBB2_mut",
+    "ERBB2_amp",
     "PIK3CA_mut",
-    "SMARCA4_amp",
+    "SMARCA4_mut",
     "KDM6A_mut",
     "ATM_mut",
     "MUTATION_COUNT",
@@ -147,14 +147,14 @@ PDAC_EXPRESSION_SIGNATURES = {
 DEFAULT_BACKGROUND_GENES = [f"BG_{i:02d}" for i in range(40)]
 
 DEFAULT_PALETTE = {
-    "Proneural": "#1f77b4",
-    "Classical": "#ff7f0e",
-    "Mesenchymal": "#2ca02c",
+    "Classical": "#1f77b4",
+    "Quasimesenchymal": "#ff7f0e",
+    "Exocrine_like": "#2ca02c",
     "Mixed/Ambiguous": "#7f7f7f",
     "Mixed": "#7f7f7f",
 }
 
-TARGET_SUBTYPES = ["Classical", "Quasimesenchymal", "Exocrine-like", "Mixed/Ambiguous"]
+TARGET_SUBTYPES = ["Classical", "Quasimesenchymal", "Exocrine_like", "Mixed/Ambiguous"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -218,39 +218,109 @@ def save_figure(fig, output_dir: Path, filename: str, dpi: int, overwrite: bool)
     return path
 
 
-def load_cohort(input_csv: str | None) -> pd.DataFrame:
-    """Load the cohort from the existing generator or an optional CSV file."""
+# Approximate PDAC driver-gene alteration frequencies used only to make the *synthetic*
+# gene-level flags below plausible in aggregate (the MSK-IMPACT clinical export has no
+# real per-gene calls). Illustrative, teaching-oriented figures — not precise citations.
+PDAC_DRIVER_BASE_RATES = {
+    "KRAS_mut": 0.90,
+    "TP53_mut": 0.70,
+    "CDKN2A_del": 0.35,
+    "CDKN2B_del": 0.20,
+    "SMAD4_del": 0.20,
+    "ARID1A_mut": 0.10,
+    "RNF43_mut": 0.06,
+    "GNAS_mut": 0.05,
+    "BRCA2_mut": 0.05,
+    "BRCA1_mut": 0.02,
+    "PALB2_mut": 0.02,
+    "STK11_mut": 0.02,
+    "TGFBR2_mut": 0.05,
+    "MYC_amp": 0.10,
+    "ERBB2_amp": 0.03,
+    "PIK3CA_mut": 0.03,
+    "SMARCA4_mut": 0.05,
+    "KDM6A_mut": 0.05,
+    "ATM_mut": 0.05,
+}
+
+
+def _synthesize_pdac_driver_flags(clinical: pd.DataFrame, random_seed: int) -> pd.DataFrame:
+    """Fabricate per-gene boolean driver flags for a cohort with no real gene-level calls."""
+    rng = np.random.default_rng(random_seed + 7)
+    clinical = clinical.copy()
+    tmb = pd.to_numeric(clinical.get("TMB_SCORE", pd.Series(0.0, index=clinical.index)), errors="coerce").fillna(0.0)
+    tmb_boost = np.clip(tmb / 20.0, 0.0, 0.15)
+    for gene, base_rate in PDAC_DRIVER_BASE_RATES.items():
+        probs = np.clip(base_rate + tmb_boost, 0.0, 0.97)
+        clinical[gene] = rng.random(len(clinical)) < probs.to_numpy()
+    return clinical
+
+
+def _load_msk_impact_pdac_clinical(path: Path, random_seed: int) -> pd.DataFrame:
+    """Load the real MSK-IMPACT PDAC clinical TSV and reshape it to the pipeline's schema."""
+    raw = pd.read_csv(path, sep="\t")
+    required_source_columns = [
+        "Sample ID",
+        "Age at Diagnosis",
+        "Sex",
+        "Sample Type",
+        "Mutation Count",
+        "Fraction Genome Altered",
+        "Overall Survival (Months)",
+        "Overall Survival Status",
+    ]
+    missing = [col for col in required_source_columns if col not in raw.columns]
+    if missing:
+        raise ValueError(f"The MSK-IMPACT clinical file is missing expected columns: {', '.join(missing)}")
+
+    cohort = pd.DataFrame()
+    cohort["SOURCE_SAMPLE_ID"] = raw["Sample ID"]
+    cohort["AGE"] = pd.to_numeric(raw["Age at Diagnosis"], errors="coerce")
+    cohort["SEX"] = raw["Sex"]
+    cohort["SAMPLE_TYPE"] = raw["Sample Type"]
+    cohort["MUTATION_COUNT"] = pd.to_numeric(raw["Mutation Count"], errors="coerce")
+    cohort["FGA"] = pd.to_numeric(raw["Fraction Genome Altered"], errors="coerce")
+    cohort["OS_TIME"] = pd.to_numeric(raw["Overall Survival (Months)"], errors="coerce")
+    cohort["OS_EVENT"] = raw["Overall Survival Status"].apply(lambda value: 1 if "DECEASED" in str(value) else 0)
+    cohort["TMB_SCORE"] = pd.to_numeric(raw.get("TMB Score"), errors="coerce")
+    cohort["molecular_subtype"] = "Pancreatic Adenocarcinoma"
+
+    # The real clinical export has some patients with missing/zero survival time; the
+    # survival analysis requires strictly positive OS_TIME, so drop those rows here.
+    n_before = len(cohort)
+    cohort = cohort[cohort["OS_TIME"].notna() & (cohort["OS_TIME"] > 0)].reset_index(drop=True)
+    n_dropped = n_before - len(cohort)
+    if n_dropped:
+        logger.warning("Dropped %d of %d samples with missing/zero OS_TIME.", n_dropped, n_before)
+
+    n_missing_fga = int(cohort["FGA"].isna().sum())
+    if n_missing_fga:
+        logger.warning("Filling %d missing FGA value(s) with the cohort median.", n_missing_fga)
+        cohort["FGA"] = cohort["FGA"].fillna(cohort["FGA"].median())
+
+    cohort = _synthesize_pdac_driver_flags(cohort, random_seed)
+    return cohort
+
+
+def load_cohort(input_csv: str | None, random_seed: int = 42) -> pd.DataFrame:
+    """Load the PDAC cohort from the real MSK-IMPACT clinical TSV or an optional override CSV/TSV."""
     if input_csv:
-        logger.info("Loading cohort from CSV: %s", input_csv)
-        cohort = pd.read_csv(input_csv)
+        logger.info("Loading cohort from file: %s", input_csv)
+        input_path = Path(input_csv)
+        separator = "\t" if input_path.suffix.lower() == ".tsv" else ","
+        cohort = pd.read_csv(input_path, sep=separator)
         if "molecular_subtype" not in cohort.columns:
-            raise ValueError("The input CSV must contain a 'molecular_subtype' column.")
+            # Assume this is the raw MSK-IMPACT clinical export rather than a pre-shaped file.
+            cohort = _load_msk_impact_pdac_clinical(input_path, random_seed)
         return _prepare_cohort_dataframe(cohort)
 
-    logger.info("Loading cohort via generate_representative_cohort()")
-    script_dir = Path(__file__).resolve().parent
-    if str(script_dir) not in sys.path:
-        sys.path.insert(0, str(script_dir))
-
-    try:
-        from generate_figures import generate_representative_cohort
-    except Exception as exc:  # pragma: no cover
-        raise ImportError(
-            "Could not import generate_figures.py. Ensure the file is present in the workspace and importable."
-        ) from exc
-
-    try:
-        generator = generate_representative_cohort
-        signature = inspect.signature(generator)
-        if len(signature.parameters) == 0:
-            cohort = generator()
-        else:
-            cohort = generator(**{})
-    except TypeError as exc:
-        raise TypeError(
-            "The imported generator did not match the expected no-argument interface."
-        ) from exc
-
+    default_path = Path(__file__).resolve().parent / "msk_impact_50k_2026_clinical_data.tsv"
+    logger.info("Loading cohort from default MSK-IMPACT clinical file: %s", default_path)
+    if not default_path.exists():
+        raise FileNotFoundError(
+            f"Could not find {default_path}. Pass --input-csv pointing to the MSK-IMPACT clinical TSV."
+        )
+    cohort = _load_msk_impact_pdac_clinical(default_path, random_seed)
     return _prepare_cohort_dataframe(cohort)
 
 
@@ -323,9 +393,9 @@ def _prepare_cohort_dataframe(cohort: pd.DataFrame) -> pd.DataFrame:
 
 def filter_PDAC_cohort(cohort: pd.DataFrame) -> pd.DataFrame:
     """Filter to the PDAC cohort and create synthetic sample IDs."""
-    PDAC = cohort[cohort["molecular_subtype"] == "PDAC"].copy()
+    PDAC = cohort[cohort["molecular_subtype"] == "Pancreatic Adenocarcinoma"].copy()
     if PDAC.empty:
-        raise ValueError("No 'PDAC' cases were found in the input cohort.")
+        raise ValueError("No 'Pancreatic Adenocarcinoma' cases were found in the input cohort.")
 
     # In real studies, longitudinal workflows should use separate PATIENT_ID and SAMPLE_ID fields.
     PDAC = PDAC.reset_index(drop=True)
@@ -544,10 +614,10 @@ def calculate_expression_subtype_scores(
     score_columns = [
         "CLASSICAL_SCORE",
         "QUASIMESENCHYMAL_SCORE",
-        "EXCORINE_LIKE_SCORE",
+        "EXOCRINE_LIKE_SCORE",
         "CLASSICAL_GENES_USED",
         "QUASIMESENCHYMAL_GENES_USED",
-        "EXCOCRINE_LIKE_GENES_USED",
+        "EXOCRINE_LIKE_GENES_USED",
     ]
     for column in score_columns:
         if column not in scores_df.columns:
@@ -581,7 +651,7 @@ def assign_expression_subtype(
             label = "Mixed/Ambiguous"
             confidence = "Ambiguous"
         else:
-            label = score_columns[top_index].replace("_SCORE", "").replace("CLASSICAL", "Classical").replace("QUASIMESENCHYMAL", "Quasimesenchymal").replace("Exocrine_like", "Exocrine_like")
+            label = score_columns[top_index].replace("_SCORE", "").replace("CLASSICAL", "Classical").replace("QUASIMESENCHYMAL", "Quasimesenchymal").replace("EXOCRINE_LIKE", "Exocrine_like")
             if top_score >= 0.75 and margin >= 0.60:
                 confidence = "High"
             elif top_score >= 0.45 and margin >= 0.35:
@@ -624,13 +694,13 @@ def simulate_subtype_survival(PDAC_cohort: pd.DataFrame, rng: np.random.Generato
     base_time *= 12.0
     subtype_effect = np.zeros(len(simulated), dtype=float)
 
-    for subtype in ["Classical", "Quasimesenchymal", "Exocrine_Like", "Mixed/Ambiguous"]:
+    for subtype in ["Classical", "Quasimesenchymal", "Exocrine_like", "Mixed/Ambiguous"]:
         mask = simulated["PREDICTED_EXPRESSION_SUBTYPE"] == subtype
         if subtype == "Classical":
             subtype_effect[mask] = -0.08
         elif subtype == "Quasimesenchymal":
             subtype_effect[mask] = -0.05
-        elif subtype == "Exocrine_Like":
+        elif subtype == "Exocrine_like":
             subtype_effect[mask] = 0.02
         else:
             subtype_effect[mask] = 0.04
@@ -732,19 +802,19 @@ def run_genomic_enrichment_analysis(
     overwrite: bool,
 ) -> pd.DataFrame:
     """Calculate enrichment of genomic alterations by predicted expression subtype."""
-    subtype_labels = ["Classical", "Quasimesenchymal", "Exocrine_Like", "Mixed/Ambiguous"]
+    subtype_labels = ["Classical", "Quasimesenchymal", "Exocrine_like", "Mixed/Ambiguous"]
     feature_list = [
-        "EGFR_any",
-        "NF1_any",
-        "PDGFRA_any",
-        "PTEN_any",
-        "CDKN2A_any",
-        "CDKN2B_any",
-        "TP53_any",
-        "RB1_any",
-        "PIK3CA_any",
-        "PIK3R1_any",
-        "MET_any",
+        "RNF43_mut",
+        "ARID1A_mut",
+        "GNAS_mut",
+        "SMAD4_del",
+        "CDKN2A_del",
+        "CDKN2B_del",
+        "TP53_mut",
+        "KDM6A_mut",
+        "PIK3CA_mut",
+        "BRCA2_mut",
+        "MYC_amp",
     ]
 
     results = []
@@ -809,7 +879,7 @@ def evaluate_classification(
     if latent_col not in merged_cohort.columns or pred_col not in merged_cohort.columns:
         raise ValueError("Classification evaluation requires latent and predicted subtype columns.")
 
-    strict_classes = ["Classical", "Quasimesenchymal", "Exocrine_Like", "Mixed", "Mixed/Ambiguous"]
+    strict_classes = ["Classical", "Quasimesenchymal", "Exocrine_like", "Mixed", "Mixed/Ambiguous"]
     strict_true = []
     strict_pred = []
 
@@ -827,10 +897,10 @@ def evaluate_classification(
         "strict_percentage_mixed_ambiguous": (np.array(strict_pred) == "Mixed/Ambiguous").mean(),
     }
 
-    single_class_mask = np.array([label in {"Classical", "Quasimesenchymal", "Exocrine_Like"} for label in strict_true]) & np.array([pred in {"Classical", "Quasimesenchymal", "Exocrine_Like"} for pred in strict_pred])
+    single_class_mask = np.array([label in {"Classical", "Quasimesenchymal", "Exocrine_like"} for label in strict_true]) & np.array([pred in {"Classical", "Quasimesenchymal", "Exocrine_like"} for pred in strict_pred])
     single_true = np.array(strict_true)[single_class_mask]
     single_pred = np.array(strict_pred)[single_class_mask]
-    single_classes = ["Classical", "Quasimesenchymal", "Exocrine_Like"]
+    single_classes = ["Classical", "Quasimesenchymal", "Exocrine_like"]
     single_metrics = {
         "overall_accuracy": _overall_accuracy(single_true, single_pred, single_classes),
         "balanced_accuracy": _balanced_accuracy(single_true, single_pred, single_classes),
@@ -840,9 +910,9 @@ def evaluate_classification(
 
     metrics_rows = []
     for name, metrics in {"strict": strict_metrics, "single_class_only": single_metrics}.items():
-        for class_name in strict_classes if name == "strict" else ["Classical", "Quasimesenchymal", "Exocrine_Like"]:
-            precision = _precision_for_class(metrics["confusion_matrix"], class_name, classes=strict_classes if name == "strict" else ["Classical", "Quasimesenchymal", "Exocrine_Like"])
-            recall = _recall_for_class(metrics["confusion_matrix"], class_name, classes=strict_classes if name == "strict" else ["Classical", "Quasimesenchymal", "Exocrine_Like"])
+        for class_name in strict_classes if name == "strict" else ["Classical", "Quasimesenchymal", "Exocrine_like"]:
+            precision = _precision_for_class(metrics["confusion_matrix"], class_name, classes=strict_classes if name == "strict" else ["Classical", "Quasimesenchymal", "Exocrine_like"])
+            recall = _recall_for_class(metrics["confusion_matrix"], class_name, classes=strict_classes if name == "strict" else ["Classical", "Quasimesenchymal", "Exocrine_like"])
             f1 = _f1_score(precision, recall)
             metrics_rows.append(
                 {
@@ -966,7 +1036,7 @@ def fig2_PDAC_expression_signature_heatmap(
     max_heatmap_samples: int,
 ) -> Path:
     """Figure 2: expression-signature heatmap across the PDAC samples."""
-    signature_genes = [gene for program in ["Classical", "Quasimesenchymal", "Exocrine_Like"] for gene in signatures[program]]
+    signature_genes = [gene for program in ["Classical", "Quasimesenchymal", "Exocrine_like"] for gene in signatures[program]]
     signature_matrix = standardized_expression.loc[merged_cohort["SAMPLE_ID"], signature_genes]
 
     sample_order = merged_cohort.sort_values(["PREDICTED_EXPRESSION_SUBTYPE", "CLASSIFICATION_CONFIDENCE"], kind="mergesort")
@@ -977,9 +1047,9 @@ def fig2_PDAC_expression_signature_heatmap(
     annotation = pd.DataFrame(
         {
             "Predicted subtype": sample_order["PREDICTED_EXPRESSION_SUBTYPE"].tolist(),
-            "EGFR_amp": sample_order["EGFR_amp"].astype(bool).astype(str),
-            "NF1_mut": sample_order["NF1_mut"].astype(bool).astype(str),
-            "PDGFRA_amp": sample_order["PDGFRA_amp"].astype(bool).astype(str),
+            "RNF43_mut": sample_order["RNF43_mut"].astype(bool).astype(str),
+            "ARID1A_mut": sample_order["ARID1A_mut"].astype(bool).astype(str),
+            "GNAS_mut": sample_order["GNAS_mut"].astype(bool).astype(str),
         },
         index=sample_ids,
     )
@@ -1049,7 +1119,7 @@ def fig4_PDAC_expression_pca(
     fig, ax = plt.subplots(figsize=(7, 6))
 
     legend_handles = []
-    for subtype in ["Classical", "Quasimesenchymal", "Exocrine_Like", "Mixed/Ambiguous"]:
+    for subtype in ["Classical", "Quasimesenchymal", "Exocrine_like", "Mixed/Ambiguous"]:
         subset = plot_df[plot_df["SUBTYPE"] == subtype]
         if subset.empty:
             continue
@@ -1082,7 +1152,7 @@ def fig5_PDAC_classification_confidence(
     fig, ax = plt.subplots(figsize=(8, 5.5))
     plot_values = []
     labels = []
-    for subtype in ["Classical", "Quasimesenchymal", "Exocrine_Like", "Mixed/Ambiguous"]:
+    for subtype in ["Classical", "Quasimesenchymal", "Exocrine_like", "Mixed/Ambiguous"]:
         values = merged_cohort.loc[merged_cohort["PREDICTED_EXPRESSION_SUBTYPE"] == subtype, "SUBTYPE_MARGIN"]
         if values.empty:
             continue
@@ -1107,7 +1177,7 @@ def fig6_PDAC_expression_confusion_matrix(
     overwrite: bool,
 ) -> Path:
     """Figure 6: latent-versus-predicted confusion matrix for the synthetic generator validation."""
-    labels = ["Classical", "Quasimesenchymal", "Exocrine_Like", "Mixed", "Mixed/Ambiguous"]
+    labels = ["Classical", "Quasimesenchymal", "Exocrine_like", "Mixed", "Mixed/Ambiguous"]
     confusion = pd.DataFrame(index=labels, columns=labels, data=0)
     for _, row in merged_cohort.iterrows():
         true_label = str(row["LATENT_EXPRESSION_SUBTYPE"])
@@ -1139,23 +1209,23 @@ def fig8_PDAC_genomic_frequency_by_expression_subtype(
 ) -> Path:
     """Figure 8: genomic alteration frequency by predicted expression subtype."""
     features = [
-        "EGFR_any",
-        "NF1_any",
-        "PDGFRA_any",
-        "PTEN_any",
-        "CDKN2A_any",
-        "CDKN2B_any",
-        "TP53_any",
-        "RB1_any",
-        "PIK3CA_any",
-        "PIK3R1_any",
-        "MET_any",
+        "RNF43_mut",
+        "ARID1A_mut",
+        "GNAS_mut",
+        "SMAD4_del",
+        "CDKN2A_del",
+        "CDKN2B_del",
+        "TP53_mut",
+        "KDM6A_mut",
+        "PIK3CA_mut",
+        "BRCA2_mut",
+        "MYC_amp",
     ]
     plot_rows = []
     for feature in features:
         if feature not in merged_cohort.columns:
             continue
-        for subtype in ["Classical", "Quasimesenchymal", "Exocrine_Like", "Mixed/Ambiguous"]:
+        for subtype in ["Classical", "Quasimesenchymal", "Exocrine_like", "Mixed/Ambiguous"]:
             subgroup = merged_cohort[merged_cohort["PREDICTED_EXPRESSION_SUBTYPE"] == subtype]
             if subgroup.empty:
                 continue
@@ -1187,7 +1257,7 @@ def fig9_PDAC_burden_by_expression_subtype(
     fig, axes = plt.subplots(1, 2, figsize=(10, 4.5))
     for ax, variable in zip(axes, ["MUTATION_COUNT", "FGA"]):
         data = []
-        for subtype in ["Classical", "Quasimesenchymal", "Exocrine_Like", "Mixed/Ambiguous"]:
+        for subtype in ["Classical", "Quasimesenchymal", "Exocrine_like", "Mixed/Ambiguous"]:
             subset = merged_cohort[merged_cohort["PREDICTED_EXPRESSION_SUBTYPE"] == subtype]
             if subset.empty:
                 continue
@@ -1220,10 +1290,10 @@ def fig10_PDAC_deep_dive_overview(
     axes[0, 0].set_title("Predicted subtypes")
     axes[0, 0].set_ylabel("Samples")
 
-    if "EGFR_any" in merged_cohort.columns:
-        freqs = merged_cohort.groupby("PREDICTED_EXPRESSION_SUBTYPE")["EGFR_any"].mean() * 100.0
+    if "RNF43_mut" in merged_cohort.columns:
+        freqs = merged_cohort.groupby("PREDICTED_EXPRESSION_SUBTYPE")["RNF43_mut"].mean() * 100.0
         freqs.reindex(TARGET_SUBTYPES, fill_value=np.nan).plot(kind="bar", ax=axes[0, 1], color=[DEFAULT_PALETTE[label] for label in freqs.index], edgecolor="black")
-        axes[0, 1].set_title("EGFR_any frequency")
+        axes[0, 1].set_title("RNF43_mut frequency")
         axes[0, 1].set_ylabel("% altered")
 
     confidence_counts = merged_cohort["CLASSIFICATION_CONFIDENCE"].value_counts().reindex(["High", "Moderate", "Low", "Ambiguous"], fill_value=0)
@@ -1264,8 +1334,8 @@ def main() -> None: # Runs the pipeline for the PDAC deep-dive analysis, includi
     logger.info("Starting PDAC deep-dive analysis")
     logger.info("Output directory: %s", output_dir)
 
-    cohort = load_cohort(args.input_csv) # 1. Obtain the existing synthetic cohort from generate_figures.py
-    PDAC_cohort = filter_PDAC_cohort(cohort) # 2. Select only IDH-wildtype PDAC cases: 1100 records
+    cohort = load_cohort(args.input_csv, args.seed) # 1. Load the real MSK-IMPACT PDAC clinical cohort
+    PDAC_cohort = filter_PDAC_cohort(cohort) # 2. Select Pancreatic Adenocarcinoma cases from the MSK-IMPACT clinical cohort
     PDAC_cohort = assign_latent_expression_subtype(
         PDAC_cohort,
         genomic_enrichment_strength=args.genomic_enrichment_strength,
@@ -1388,11 +1458,11 @@ def main() -> None: # Runs the pipeline for the PDAC deep-dive analysis, includi
     save_json(metadata, output_dir, "PDAC_run_metadata.json", args.overwrite)
 
     logger.info("Original cohort rows: %d", len(cohort))
-    logger.info("IDH-wildtype PDAC rows: %d", len(PDAC_cohort))
+    logger.info("Pancreatic Adenocarcinoma rows: %d", len(PDAC_cohort))
     logger.info("Expression genes generated: %d", standardized_expression.shape[1])
     logger.info("Predicted Classical: %d", int((merged_cohort["PREDICTED_EXPRESSION_SUBTYPE"] == "Classical").sum()))
     logger.info("Predicted Quasimesenchymal: %d", int((merged_cohort["PREDICTED_EXPRESSION_SUBTYPE"] == "Quasimesenchymal").sum()))
-    logger.info("Predicted Exocrine_Like: %d", int((merged_cohort["PREDICTED_EXPRESSION_SUBTYPE"] == "Exocrine_Like").sum()))
+    logger.info("Predicted Exocrine_like: %d", int((merged_cohort["PREDICTED_EXPRESSION_SUBTYPE"] == "Exocrine_like").sum()))
     logger.info("Predicted Mixed/Ambiguous: %d", int((merged_cohort["PREDICTED_EXPRESSION_SUBTYPE"] == "Mixed/Ambiguous").sum()))
     logger.info("Figures generated: 10")
     logger.info("Output directory: %s", output_dir)
