@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Synthetic GBM deep-dive figure pipeline for educational and research prototyping.
+"""Synthetic PDAC deep-dive figure pipeline for educational and research prototyping.
 
 This script extends the existing synthetic glioma cohort by creating a focused
-IDH-wildtype GBM analysis. It generates synthetic bulk RNA-expression data,
+IDH-wildtype PDAC analysis. It generates synthetic bulk RNA-expression data,
 classifies tumors into transcriptional subtype groups, validates the synthetic
 classification against hidden generator labels, and produces a comprehensive set
 of figures and result tables.
@@ -74,7 +74,7 @@ except ImportError:  # pragma: no cover
 
 warnings.filterwarnings("ignore")
 
-logger = logging.getLogger("gbm_deep_dive")
+logger = logging.getLogger("PDAC_deep_dive")
 logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
 
 PROGRAM_VERSION = "0.1.0"
@@ -85,24 +85,24 @@ REQUIRED_COLUMNS = [
     "AGE",
     "SEX",
     "SAMPLE_TYPE",
-    "IDH1_mut",
-    "IDH2_mut",
+    "KRAS_mut",
     "TP53_mut",
-    "ATRX_mut",
-    "TERT_mut",
-    "EGFR_amp",
-    "PTEN_del",
-    "CDKN2A_del",
-    "CDKN2B_del",
-    "NF1_mut",
-    "RB1_mut",
+    "CDKN2A_mut",
+    "CDKN2B_mut",
+    "SMAD4_mut",
+    "ARID1A_amp",
+    "RNF43_del",
+    "GNAS_del",
+    "BRCA1_del",
+    "BRCA2_mut",
+    "PALB2_mut",
+    "STK11_mut",
+    "TGFBR2_mut",
+    "MYC_amp",
+    "ERBB2_mut",
     "PIK3CA_mut",
-    "PIK3R1_mut",
-    "PDGFRA_amp",
-    "ARID1A_mut",
-    "SETD2_mut",
-    "MET_amp",
-    "FGFR3_mut",
+    "SMARCA4_amp",
+    "KDM6A_mut",
     "ATM_mut",
     "MUTATION_COUNT",
     "FGA",
@@ -111,8 +111,8 @@ REQUIRED_COLUMNS = [
 ]
 
 # 2. Configuration and expression signatures
-GBM_EXPRESSION_SIGNATURES = {
-    "Proneural": [
+PDAC_EXPRESSION_SIGNATURES = {
+    "Classical": [
         "OLIG2",
         "SOX10",
         "PDGFRA",
@@ -122,7 +122,7 @@ GBM_EXPRESSION_SIGNATURES = {
         "DLL3",
         "BCAN",
     ],
-    "Classical": [
+    "Quasimesenchymal": [
         "EGFR",
         "NES",
         "CDK4",
@@ -132,7 +132,7 @@ GBM_EXPRESSION_SIGNATURES = {
         "YAP1",
         "RASGRF1",
     ],
-    "Mesenchymal": [
+    "Exocrine_like": [
         "CD44",
         "CHI3L1",
         "RELB",
@@ -154,14 +154,14 @@ DEFAULT_PALETTE = {
     "Mixed": "#7f7f7f",
 }
 
-TARGET_SUBTYPES = ["Proneural", "Classical", "Mesenchymal", "Mixed/Ambiguous"]
+TARGET_SUBTYPES = ["Classical", "Quasimesenchymal", "Exocrine-like", "Mixed/Ambiguous"]
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse CLI arguments for the GBM deep-dive pipeline."""
-    parser = argparse.ArgumentParser(description="Generate synthetic GBM RNA-expression deep-dive figures")
+    """Parse CLI arguments for the PDAC deep-dive pipeline."""
+    parser = argparse.ArgumentParser(description="Generate synthetic PDAC RNA-expression deep-dive figures")
     parser.add_argument("--input-csv", type=str, default=None, help="Optional CSV file with the existing synthetic cohort")
-    parser.add_argument("--output-dir", type=str, default="figures/gbm_deep_dive", help="Directory for outputs")
+    parser.add_argument("--output-dir", type=str, default="figures/PDAC_deep_dive", help="Directory for outputs")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for all synthetic steps")
     parser.add_argument("--minimum-margin", type=float, default=0.25, help="Minimum subtype-score margin for confident classification")
     parser.add_argument("--minimum-top-score", type=float, default=None, help="Optional minimum top-score threshold")
@@ -289,24 +289,24 @@ def _prepare_cohort_dataframe(cohort: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("OS_EVENT must contain only 0/1 values for event status.")
 
     for col in [
-        "IDH1_mut",
-        "IDH2_mut",
+        "KRAS_mut",
         "TP53_mut",
-        "ATRX_mut",
-        "TERT_mut",
-        "EGFR_amp",
-        "PTEN_del",
         "CDKN2A_del",
         "CDKN2B_del",
-        "NF1_mut",
-        "RB1_mut",
-        "PIK3CA_mut",
-        "PIK3R1_mut",
-        "PDGFRA_amp",
+        "SMAD4_del",
         "ARID1A_mut",
-        "SETD2_mut",
-        "MET_amp",
-        "FGFR3_mut",
+        "RNF43_mut",
+        "GNAS_mut",
+        "BRCA2_mut",
+        "BRCA1_mut",
+        "PALB2_mut",
+        "STK11_mut",
+        "TGFBR2_mut",
+        "MYC_amp",
+        "ERBB2_amp",
+        "PIK3CA_mut",
+        "SMARCA4_mut",
+        "KDM6A_mut",
         "ATM_mut",
     ]:
         if col in cohort.columns:
@@ -321,40 +321,40 @@ def _prepare_cohort_dataframe(cohort: pd.DataFrame) -> pd.DataFrame:
     return cohort
 
 
-def filter_gbm_cohort(cohort: pd.DataFrame) -> pd.DataFrame:
-    """Filter to the IDH-wildtype GBM cohort and create synthetic sample IDs."""
-    gbm = cohort[cohort["molecular_subtype"] == "IDH-wildtype GBM"].copy()
-    if gbm.empty:
-        raise ValueError("No 'IDH-wildtype GBM' cases were found in the input cohort.")
+def filter_PDAC_cohort(cohort: pd.DataFrame) -> pd.DataFrame:
+    """Filter to the PDAC cohort and create synthetic sample IDs."""
+    PDAC = cohort[cohort["molecular_subtype"] == "PDAC"].copy()
+    if PDAC.empty:
+        raise ValueError("No 'PDAC' cases were found in the input cohort.")
 
     # In real studies, longitudinal workflows should use separate PATIENT_ID and SAMPLE_ID fields.
-    gbm = gbm.reset_index(drop=True)
-    gbm["SAMPLE_ID"] = [f"GBM_{index:04d}" for index in range(1, len(gbm) + 1)]
-    return gbm
+    PDAC = PDAC.reset_index(drop=True)
+    PDAC["SAMPLE_ID"] = [f"PDAC_{index:04d}" for index in range(1, len(PDAC) + 1)]
+    return PDAC
 
 
 def assign_latent_expression_subtype(
-    gbm_cohort: pd.DataFrame,
+    PDAC_cohort: pd.DataFrame,
     genomic_enrichment_strength: float,
     mixed_fraction: float,
     random_seed: int,
 ) -> pd.DataFrame:
     """Assign a hidden latent expression subtype using soft genomic enrichment."""
     rng = np.random.default_rng(random_seed + 99)
-    subtypes = ["Proneural", "Classical", "Mesenchymal", "Mixed"]
+    subtypes = ["Classical", "Quasimesenchymal", "Exocrine_like", "Mixed"]
     latent_labels = []
 
-    for _, row in gbm_cohort.iterrows():
+    for _, row in PDAC_cohort.iterrows():
         probs = np.array([0.24, 0.24, 0.24, 0.28], dtype=float) # Base probabilities for Proneural, Classical, Mesenchymal, Mixed
 
         # Soft, probabilistic enrichment from genomic flags.
-        if bool(row.get("EGFR_amp", False)):
+        if bool(row.get("RNF43_mut", False)):
             probs[1] += genomic_enrichment_strength * 0.35
-        if bool(row.get("NF1_mut", False)):
+        if bool(row.get("ARID1A_mut", False)):
             probs[2] += genomic_enrichment_strength * 0.35
-        if bool(row.get("PDGFRA_amp", False)):
+        if bool(row.get("GNAS_mut", False)):
             probs[0] += genomic_enrichment_strength * 0.35
-        if bool(row.get("PTEN_del", False)):
+        if bool(row.get("SMAD4_del", False)):
             probs[1] += genomic_enrichment_strength * 0.10
         if str(row.get("SAMPLE_TYPE", "")).lower() == "recurrence":
             probs[2] += 0.06
@@ -371,13 +371,13 @@ def assign_latent_expression_subtype(
         probs = probs / probs.sum()
         latent_labels.append(rng.choice(subtypes, p=probs))
 
-    gbm_cohort = gbm_cohort.copy()
-    gbm_cohort["LATENT_EXPRESSION_SUBTYPE"] = latent_labels
-    return gbm_cohort
+    PDAC_cohort = PDAC_cohort.copy()
+    PDAC_cohort["LATENT_EXPRESSION_SUBTYPE"] = latent_labels
+    return PDAC_cohort
 
 
-def generate_synthetic_gbm_expression(
-    gbm_cohort: pd.DataFrame,
+def generate_synthetic_PDAC_expression(
+    PDAC_cohort: pd.DataFrame,
     signatures: Dict[str, List[str]],
     random_seed: int,
     subtype_effect_size: float,
@@ -385,7 +385,7 @@ def generate_synthetic_gbm_expression(
     mixed_fraction: float,
     n_background_genes: int,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Generate synthetic log2-like bulk RNA-expression data for the GBM cohort."""
+    """Generate synthetic log2-like bulk RNA-expression data for the PDAC cohort."""
     rng = np.random.default_rng(random_seed)
 
     if not signatures:
@@ -407,7 +407,7 @@ def generate_synthetic_gbm_expression(
     for gene in background_genes:
         signature_gene_to_program[gene] = "Background"
 
-    n_samples = len(gbm_cohort)
+    n_samples = len(PDAC_cohort)
     n_genes = len(gene_names)
 
     gene_baseline = rng.normal(loc=5.5, scale=0.9, size=n_genes)
@@ -420,20 +420,20 @@ def generate_synthetic_gbm_expression(
     expression += shared_noise * gene_dispersion[None, :]
 
     # Add weak associations with burden and recurrence status for realism.
-    fga = gbm_cohort["FGA"].to_numpy(dtype=float)
-    mutation_count = gbm_cohort["MUTATION_COUNT"].to_numpy(dtype=float)
+    fga = PDAC_cohort["FGA"].to_numpy(dtype=float)
+    mutation_count = PDAC_cohort["MUTATION_COUNT"].to_numpy(dtype=float)
     expression += np.outer((fga - 0.5) * 0.08, np.ones(n_genes))
     expression += np.outer(np.clip(mutation_count / 30.0, 0.0, 1.3) * 0.02, np.ones(n_genes))
 
     # Add subtype-specific structure. This is synthetic and meant to be educational.
-    for idx, row in gbm_cohort.iterrows():
+    for idx, row in PDAC_cohort.iterrows():
         latent = row["LATENT_EXPRESSION_SUBTYPE"]
         if latent == "Mixed":
-            programs = ["Proneural", "Classical"]
+            programs = ["Classical", "Quasimesenchymal"]
             if rng.random() < 0.5:
-                programs = ["Proneural", "Mesenchymal"]
+                programs = ["Classical", "Exocrine_like"]
             elif rng.random() < 0.5:
-                programs = ["Classical", "Mesenchymal"]
+                programs = ["Quasimesenchymal", "Exocrine_like"]
             effect_scale = subtype_effect_size * 0.75
         else:
             programs = [latent]
@@ -449,10 +449,10 @@ def generate_synthetic_gbm_expression(
 
     expression = np.maximum(expression, 0.5)
 
-    expression_df = pd.DataFrame(expression, index=gbm_cohort["SAMPLE_ID"].tolist(), columns=gene_names)
+    expression_df = pd.DataFrame(expression, index=PDAC_cohort["SAMPLE_ID"].tolist(), columns=gene_names)
     expression_df.index.name = "SAMPLE_ID"
 
-    metadata = gbm_cohort[["SAMPLE_ID", "LATENT_EXPRESSION_SUBTYPE"]].copy()
+    metadata = PDAC_cohort[["SAMPLE_ID", "LATENT_EXPRESSION_SUBTYPE"]].copy()
     metadata["SIMULATED_EXPRESSION_NOTE"] = "Synthetic log2-normalized bulk RNA-expression values"
     metadata["SIMULATION_SUBTYPE_EFFECT_SIZE"] = subtype_effect_size
     metadata["SIMULATION_NOISE_SD"] = noise_sd
@@ -467,7 +467,7 @@ def validate_expression_matrix(expression_matrix: pd.DataFrame, sample_ids: Sequ
         raise ValueError("The synthetic expression matrix is empty.")
 
     if len(sample_ids) != len(expression_matrix.index):
-        raise ValueError("Expression matrix row count does not match the number of GBM samples.")
+        raise ValueError("Expression matrix row count does not match the number of PDAC samples.")
 
     if expression_matrix.index.duplicated().any():
         raise ValueError("Expression matrix contains duplicate sample IDs.")
@@ -500,10 +500,10 @@ def validate_expression_matrix(expression_matrix: pd.DataFrame, sample_ids: Sequ
 
 
 def zscore_expression_by_gene(expression_matrix: pd.DataFrame) -> pd.DataFrame:
-    """Z-score each gene across the GBM samples.
+    """Z-score each gene across the PDAC samples.
 
     The z-score answers: is this gene unusually active in this sample compared with
-    the other GBM samples? The output uses standardized expression values to make
+    the other PDAC samples? The output uses standardized expression values to make
     downstream scoring and visualization more comparable.
     """
     standardized = expression_matrix.copy()
@@ -542,12 +542,12 @@ def calculate_expression_subtype_scores(
 
     scores_df = pd.DataFrame(rows)
     score_columns = [
-        "PRONEURAL_SCORE",
         "CLASSICAL_SCORE",
-        "MESENCHYMAL_SCORE",
-        "PRONEURAL_GENES_USED",
+        "QUASIMESENCHYMAL_SCORE",
+        "EXCORINE_LIKE_SCORE",
         "CLASSICAL_GENES_USED",
-        "MESENCHYMAL_GENES_USED",
+        "QUASIMESENCHYMAL_GENES_USED",
+        "EXCOCRINE_LIKE_GENES_USED",
     ]
     for column in score_columns:
         if column not in scores_df.columns:
@@ -562,7 +562,7 @@ def assign_expression_subtype(
 ) -> pd.DataFrame:
     """Classify each sample into a transcriptional subtype or Mixed/Ambiguous."""
     labelled = subtype_scores.copy()
-    score_columns = ["PRONEURAL_SCORE", "CLASSICAL_SCORE", "MESENCHYMAL_SCORE"]
+    score_columns = ["CLASSICAL_SCORE", "QUASIMESENCHYMAL_SCORE", "EXOCRINE_LIKE_SCORE"]
     classification = []
 
     for _, row in labelled.iterrows():
@@ -581,7 +581,7 @@ def assign_expression_subtype(
             label = "Mixed/Ambiguous"
             confidence = "Ambiguous"
         else:
-            label = score_columns[top_index].replace("_SCORE", "").replace("PRONEURAL", "Proneural").replace("CLASSICAL", "Classical").replace("MESENCHYMAL", "Mesenchymal")
+            label = score_columns[top_index].replace("_SCORE", "").replace("CLASSICAL", "Classical").replace("QUASIMESENCHYMAL", "Quasimesenchymal").replace("Exocrine_like", "Exocrine_like")
             if top_score >= 0.75 and margin >= 0.60:
                 confidence = "High"
             elif top_score >= 0.45 and margin >= 0.35:
@@ -599,38 +599,38 @@ def assign_expression_subtype(
     return labelled
 
 
-def validate_survival_columns(gbm_cohort: pd.DataFrame) -> None:
+def validate_survival_columns(PDAC_cohort: pd.DataFrame) -> None:
     """Validate survival fields before statistical analyses."""
-    if "OS_TIME" not in gbm_cohort.columns or "OS_EVENT" not in gbm_cohort.columns:
+    if "OS_TIME" not in PDAC_cohort.columns or "OS_EVENT" not in PDAC_cohort.columns:
         raise ValueError("The cohort must contain OS_TIME and OS_EVENT columns.")
 
-    if gbm_cohort["OS_TIME"].isna().any():
+    if PDAC_cohort["OS_TIME"].isna().any():
         raise ValueError("OS_TIME contains missing values.")
-    if gbm_cohort["OS_EVENT"].isna().any():
+    if PDAC_cohort["OS_EVENT"].isna().any():
         raise ValueError("OS_EVENT contains missing values.")
 
-    if (gbm_cohort["OS_TIME"] <= 0).any():
+    if (PDAC_cohort["OS_TIME"] <= 0).any():
         raise ValueError("OS_TIME must be strictly positive for all samples.")
 
-    events = set(pd.to_numeric(gbm_cohort["OS_EVENT"], errors="coerce").dropna().astype(int).unique())
+    events = set(pd.to_numeric(PDAC_cohort["OS_EVENT"], errors="coerce").dropna().astype(int).unique())
     if not events.issubset({0, 1}):
         raise ValueError("OS_EVENT must contain only 0 and 1 values.")
 
 
-def simulate_subtype_survival(gbm_cohort: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
+def simulate_subtype_survival(PDAC_cohort: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
     """Create synthetic subtype-associated survival outcomes without overwriting the original fields."""
-    simulated = gbm_cohort.copy()
+    simulated = PDAC_cohort.copy()
     base_time = np.exp(rng.normal(loc=2.7, scale=0.35, size=len(simulated)))
     base_time *= 12.0
     subtype_effect = np.zeros(len(simulated), dtype=float)
 
-    for subtype in ["Proneural", "Classical", "Mesenchymal", "Mixed/Ambiguous"]:
+    for subtype in ["Classical", "Quasimesenchymal", "Exocrine_Like", "Mixed/Ambiguous"]:
         mask = simulated["PREDICTED_EXPRESSION_SUBTYPE"] == subtype
-        if subtype == "Proneural":
+        if subtype == "Classical":
             subtype_effect[mask] = -0.08
-        elif subtype == "Classical":
+        elif subtype == "Quasimesenchymal":
             subtype_effect[mask] = -0.05
-        elif subtype == "Mesenchymal":
+        elif subtype == "Exocrine_Like":
             subtype_effect[mask] = 0.02
         else:
             subtype_effect[mask] = 0.04
@@ -638,8 +638,8 @@ def simulate_subtype_survival(gbm_cohort: pd.DataFrame, rng: np.random.Generator
     simulated_time = np.maximum(base_time * np.exp(subtype_effect), 1.0)
     event_prob = np.clip(0.75 - 0.006 * simulated_time + 0.03 * (simulated["MUTATION_COUNT"].astype(float) / 20.0), 0.10, 0.95)
     event_draw = rng.random(size=len(simulated)) < event_prob
-    simulated["SIMULATED_GBM_OS_TIME"] = np.round(simulated_time, 2)
-    simulated["SIMULATED_GBM_OS_EVENT"] = event_draw.astype(int)
+    simulated["SIMULATED_PDAC_OS_TIME"] = np.round(simulated_time, 2)
+    simulated["SIMULATED_PDAC_OS_EVENT"] = event_draw.astype(int)
     return simulated
 
 
@@ -652,8 +652,8 @@ def run_survival_analysis(
 ) -> Tuple[pd.DataFrame, Path]:
     """Run a Kaplan-Meier analysis and save a summary table and figure."""
     analysis_df = merged_cohort.copy()
-    time_col = "SIMULATED_GBM_OS_TIME" if use_simulated_survival else "OS_TIME"
-    event_col = "SIMULATED_GBM_OS_EVENT" if use_simulated_survival else "OS_EVENT"
+    time_col = "SIMULATED_PDAC_OS_TIME" if use_simulated_survival else "OS_TIME"
+    event_col = "SIMULATED_PDAC_OS_EVENT" if use_simulated_survival else "OS_EVENT"
 
     if use_simulated_survival:
         logger.info("Using simulated survival outcomes for the KM analysis.")
@@ -692,10 +692,10 @@ def run_survival_analysis(
     if len(analysis_df["PREDICTED_EXPRESSION_SUBTYPE"].unique()) > 1:
         try:
             result = logrank_test(
-                analysis_df.loc[analysis_df["PREDICTED_EXPRESSION_SUBTYPE"] == "Proneural", time_col],
                 analysis_df.loc[analysis_df["PREDICTED_EXPRESSION_SUBTYPE"] == "Classical", time_col],
-                event_observed_A=analysis_df.loc[analysis_df["PREDICTED_EXPRESSION_SUBTYPE"] == "Proneural", event_col],
-                event_observed_B=analysis_df.loc[analysis_df["PREDICTED_EXPRESSION_SUBTYPE"] == "Classical", event_col],
+                analysis_df.loc[analysis_df["PREDICTED_EXPRESSION_SUBTYPE"] == "Quasimesenchymal", time_col],
+                event_observed_A=analysis_df.loc[analysis_df["PREDICTED_EXPRESSION_SUBTYPE"] == "Classical", event_col],
+                event_observed_B=analysis_df.loc[analysis_df["PREDICTED_EXPRESSION_SUBTYPE"] == "Quasimesenchymal", event_col],
             )
             p_value = result.p_value
         except Exception:
@@ -705,7 +705,7 @@ def run_survival_analysis(
 
     ax.set_xlabel("Time (months)", fontsize=12)
     ax.set_ylabel("Overall Survival Probability", fontsize=12)
-    title = "Kaplan-Meier survival by predicted GBM expression subtype"
+    title = "Kaplan-Meier survival by predicted PDAC expression subtype"
     if use_simulated_survival:
         title += " (simulated subtype-associated outcomes)"
     ax.set_title(title, fontsize=13, fontweight="bold")
@@ -718,11 +718,11 @@ def run_survival_analysis(
     ax.text(0.98, 0.02, f"Log-rank p = {p_value:.3g}", transform=ax.transAxes, ha="right", va="bottom")
     ax.legend(loc="upper right")
     fig.tight_layout()
-    path = save_figure(fig, output_dir, "fig7_gbm_km_by_expression_subtype.png", dpi, overwrite)
+    path = save_figure(fig, output_dir, "fig7_PDAC_km_by_expression_subtype.png", dpi, overwrite)
 
     summary_df = pd.DataFrame(summary_rows)
     summary_df["LOG_RANK_P_VALUE"] = p_value
-    summary_path = save_dataframe_csv(summary_df, output_dir, "gbm_survival_summary.csv", overwrite)
+    summary_path = save_dataframe_csv(summary_df, output_dir, "PDAC_survival_summary.csv", overwrite)
     return summary_df, summary_path
 
 
@@ -732,7 +732,7 @@ def run_genomic_enrichment_analysis(
     overwrite: bool,
 ) -> pd.DataFrame:
     """Calculate enrichment of genomic alterations by predicted expression subtype."""
-    subtype_labels = ["Proneural", "Classical", "Mesenchymal", "Mixed/Ambiguous"]
+    subtype_labels = ["Classical", "Quasimesenchymal", "Exocrine_Like", "Mixed/Ambiguous"]
     feature_list = [
         "EGFR_any",
         "NF1_any",
@@ -794,7 +794,7 @@ def run_genomic_enrichment_analysis(
     enrichment_df = enrichment_df.sort_values(["FEATURE", "SUBTYPE"]).reset_index(drop=True)
     enrichment_df["FDR_Q_VALUE"] = multipletests(enrichment_df["P_VALUE"].fillna(1.0), method="fdr_bh")[1]
     enrichment_df["SIGNIFICANT_FDR_0_05"] = enrichment_df["FDR_Q_VALUE"] < 0.05
-    save_dataframe_csv(enrichment_df, output_dir, "gbm_genomic_enrichment_results.csv", overwrite)
+    save_dataframe_csv(enrichment_df, output_dir, "PDAC_genomic_enrichment_results.csv", overwrite)
     return enrichment_df
 
 
@@ -809,7 +809,7 @@ def evaluate_classification(
     if latent_col not in merged_cohort.columns or pred_col not in merged_cohort.columns:
         raise ValueError("Classification evaluation requires latent and predicted subtype columns.")
 
-    strict_classes = ["Proneural", "Classical", "Mesenchymal", "Mixed", "Mixed/Ambiguous"]
+    strict_classes = ["Classical", "Quasimesenchymal", "Exocrine_Like", "Mixed", "Mixed/Ambiguous"]
     strict_true = []
     strict_pred = []
 
@@ -827,10 +827,10 @@ def evaluate_classification(
         "strict_percentage_mixed_ambiguous": (np.array(strict_pred) == "Mixed/Ambiguous").mean(),
     }
 
-    single_class_mask = np.array([label in {"Proneural", "Classical", "Mesenchymal"} for label in strict_true]) & np.array([pred in {"Proneural", "Classical", "Mesenchymal"} for pred in strict_pred])
+    single_class_mask = np.array([label in {"Classical", "Quasimesenchymal", "Exocrine_Like"} for label in strict_true]) & np.array([pred in {"Classical", "Quasimesenchymal", "Exocrine_Like"} for pred in strict_pred])
     single_true = np.array(strict_true)[single_class_mask]
     single_pred = np.array(strict_pred)[single_class_mask]
-    single_classes = ["Proneural", "Classical", "Mesenchymal"]
+    single_classes = ["Classical", "Quasimesenchymal", "Exocrine_Like"]
     single_metrics = {
         "overall_accuracy": _overall_accuracy(single_true, single_pred, single_classes),
         "balanced_accuracy": _balanced_accuracy(single_true, single_pred, single_classes),
@@ -840,9 +840,9 @@ def evaluate_classification(
 
     metrics_rows = []
     for name, metrics in {"strict": strict_metrics, "single_class_only": single_metrics}.items():
-        for class_name in strict_classes if name == "strict" else ["Proneural", "Classical", "Mesenchymal"]:
-            precision = _precision_for_class(metrics["confusion_matrix"], class_name, classes=strict_classes if name == "strict" else ["Proneural", "Classical", "Mesenchymal"])
-            recall = _recall_for_class(metrics["confusion_matrix"], class_name, classes=strict_classes if name == "strict" else ["Proneural", "Classical", "Mesenchymal"])
+        for class_name in strict_classes if name == "strict" else ["Classical", "Quasimesenchymal", "Exocrine_Like"]:
+            precision = _precision_for_class(metrics["confusion_matrix"], class_name, classes=strict_classes if name == "strict" else ["Classical", "Quasimesenchymal", "Exocrine_Like"])
+            recall = _recall_for_class(metrics["confusion_matrix"], class_name, classes=strict_classes if name == "strict" else ["Classical", "Quasimesenchymal", "Exocrine_Like"])
             f1 = _f1_score(precision, recall)
             metrics_rows.append(
                 {
@@ -867,7 +867,7 @@ def evaluate_classification(
         )
 
     metrics_df = pd.DataFrame(metrics_rows)
-    save_dataframe_csv(metrics_df, output_dir, "gbm_classification_metrics.csv", overwrite)
+    save_dataframe_csv(metrics_df, output_dir, "PDAC_classification_metrics.csv", overwrite)
     return metrics_df
 
 
@@ -931,7 +931,7 @@ def make_summary_counts(merged_cohort: pd.DataFrame) -> pd.DataFrame:
     return summary
 
 
-def fig1_gbm_expression_subtype_summary(
+def fig1_PDAC_expression_subtype_summary(
     merged_cohort: pd.DataFrame,
     output_dir: Path,
     dpi: int,
@@ -951,12 +951,12 @@ def fig1_gbm_expression_subtype_summary(
     axes[1].set_ylabel("Samples")
     axes[1].tick_params(axis="x", rotation=0)
 
-    fig.suptitle("GBM expression subtype summary", fontsize=14, fontweight="bold")
+    fig.suptitle("PDAC expression subtype summary", fontsize=14, fontweight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.96])
-    return save_figure(fig, output_dir, "fig1_gbm_expression_subtype_summary.png", dpi, overwrite)
+    return save_figure(fig, output_dir, "fig1_PDAC_expression_subtype_summary.png", dpi, overwrite)
 
 
-def fig2_gbm_expression_signature_heatmap(
+def fig2_PDAC_expression_signature_heatmap(
     merged_cohort: pd.DataFrame,
     standardized_expression: pd.DataFrame,
     signatures: Dict[str, List[str]],
@@ -965,8 +965,8 @@ def fig2_gbm_expression_signature_heatmap(
     overwrite: bool,
     max_heatmap_samples: int,
 ) -> Path:
-    """Figure 2: expression-signature heatmap across the GBM samples."""
-    signature_genes = [gene for program in ["Proneural", "Classical", "Mesenchymal"] for gene in signatures[program]]
+    """Figure 2: expression-signature heatmap across the PDAC samples."""
+    signature_genes = [gene for program in ["Classical", "Quasimesenchymal", "Exocrine_Like"] for gene in signatures[program]]
     signature_matrix = standardized_expression.loc[merged_cohort["SAMPLE_ID"], signature_genes]
 
     sample_order = merged_cohort.sort_values(["PREDICTED_EXPRESSION_SUBTYPE", "CLASSIFICATION_CONFIDENCE"], kind="mergesort")
@@ -1003,17 +1003,17 @@ def fig2_gbm_expression_signature_heatmap(
         fig.colorbar(heat, ax=ax, shrink=0.8)
     ax.set_title("Standardized signature-gene expression")
     fig.tight_layout()
-    return save_figure(fig, output_dir, "fig2_gbm_expression_signature_heatmap.png", dpi, overwrite)
+    return save_figure(fig, output_dir, "fig2_PDAC_expression_signature_heatmap.png", dpi, overwrite)
 
 
-def fig3_gbm_subtype_score_heatmap(
+def fig3_PDAC_subtype_score_heatmap(
     subtype_scores: pd.DataFrame,
     output_dir: Path,
     dpi: int,
     overwrite: bool,
 ) -> Path:
-    """Figure 3: heatmap of subtype-score values across GBM samples."""
-    score_matrix = subtype_scores[["PRONEURAL_SCORE", "CLASSICAL_SCORE", "MESENCHYMAL_SCORE"]].T
+    """Figure 3: heatmap of subtype-score values across PDAC samples."""
+    score_matrix = subtype_scores[["CLASSICAL_SCORE", "QUASIMESENCHYMAL_SCORE", "EXOCRINE_LIKE_SCORE"]].T
     fig, ax = plt.subplots(figsize=(max(8, len(subtype_scores) * 0.12), 4.5))
     heat = ax.imshow(score_matrix.values, aspect="auto", cmap="viridis")
     ax.set_yticks(range(len(score_matrix.index)))
@@ -1023,10 +1023,10 @@ def fig3_gbm_subtype_score_heatmap(
     ax.set_title("Subtype score heatmap")
     fig.colorbar(heat, ax=ax, shrink=0.8)
     fig.tight_layout()
-    return save_figure(fig, output_dir, "fig3_gbm_subtype_score_heatmap.png", dpi, overwrite)
+    return save_figure(fig, output_dir, "fig3_PDAC_subtype_score_heatmap.png", dpi, overwrite)
 
 
-def fig4_gbm_expression_pca(
+def fig4_PDAC_expression_pca(
     standardized_expression: pd.DataFrame,
     merged_cohort: pd.DataFrame,
     output_dir: Path,
@@ -1049,7 +1049,7 @@ def fig4_gbm_expression_pca(
     fig, ax = plt.subplots(figsize=(7, 6))
 
     legend_handles = []
-    for subtype in ["Proneural", "Classical", "Mesenchymal", "Mixed/Ambiguous"]:
+    for subtype in ["Classical", "Quasimesenchymal", "Exocrine_Like", "Mixed/Ambiguous"]:
         subset = plot_df[plot_df["SUBTYPE"] == subtype]
         if subset.empty:
             continue
@@ -1063,15 +1063,15 @@ def fig4_gbm_expression_pca(
 
     ax.set_xlabel(f"PC1 ({explained_var[0] * 100:.1f}% variance)")
     ax.set_ylabel(f"PC2 ({explained_var[1] * 100:.1f}% variance)")
-    ax.set_title("PCA of synthetic GBM expression data")
+    ax.set_title("PCA of synthetic PDAC expression data")
     ax.grid(alpha=0.2)
     if legend_handles:
         ax.legend(handles=legend_handles, title="Predicted subtype")
     fig.tight_layout()
-    return save_figure(fig, output_dir, "fig4_gbm_expression_pca.png", dpi, overwrite)
+    return save_figure(fig, output_dir, "fig4_PDAC_expression_pca.png", dpi, overwrite)
 
 
-def fig5_gbm_classification_confidence(
+def fig5_PDAC_classification_confidence(
     merged_cohort: pd.DataFrame,
     output_dir: Path,
     dpi: int,
@@ -1082,7 +1082,7 @@ def fig5_gbm_classification_confidence(
     fig, ax = plt.subplots(figsize=(8, 5.5))
     plot_values = []
     labels = []
-    for subtype in ["Proneural", "Classical", "Mesenchymal", "Mixed/Ambiguous"]:
+    for subtype in ["Classical", "Quasimesenchymal", "Exocrine_Like", "Mixed/Ambiguous"]:
         values = merged_cohort.loc[merged_cohort["PREDICTED_EXPRESSION_SUBTYPE"] == subtype, "SUBTYPE_MARGIN"]
         if values.empty:
             continue
@@ -1097,17 +1097,17 @@ def fig5_gbm_classification_confidence(
     ax.set_title("Classification confidence by predicted subtype")
     ax.legend()
     fig.tight_layout()
-    return save_figure(fig, output_dir, "fig5_gbm_classification_confidence.png", dpi, overwrite)
+    return save_figure(fig, output_dir, "fig5_PDAC_classification_confidence.png", dpi, overwrite)
 
 
-def fig6_gbm_expression_confusion_matrix(
+def fig6_PDAC_expression_confusion_matrix(
     merged_cohort: pd.DataFrame,
     output_dir: Path,
     dpi: int,
     overwrite: bool,
 ) -> Path:
     """Figure 6: latent-versus-predicted confusion matrix for the synthetic generator validation."""
-    labels = ["Proneural", "Classical", "Mesenchymal", "Mixed", "Mixed/Ambiguous"]
+    labels = ["Classical", "Quasimesenchymal", "Exocrine_Like", "Mixed", "Mixed/Ambiguous"]
     confusion = pd.DataFrame(index=labels, columns=labels, data=0)
     for _, row in merged_cohort.iterrows():
         true_label = str(row["LATENT_EXPRESSION_SUBTYPE"])
@@ -1128,10 +1128,10 @@ def fig6_gbm_expression_confusion_matrix(
     ax.set_title("Latent versus predicted expression subtype")
     fig.colorbar(image, ax=ax)
     fig.tight_layout()
-    return save_figure(fig, output_dir, "fig6_gbm_expression_confusion_matrix.png", dpi, overwrite)
+    return save_figure(fig, output_dir, "fig6_PDAC_expression_confusion_matrix.png", dpi, overwrite)
 
 
-def fig8_gbm_genomic_frequency_by_expression_subtype(
+def fig8_PDAC_genomic_frequency_by_expression_subtype(
     merged_cohort: pd.DataFrame,
     output_dir: Path,
     dpi: int,
@@ -1155,7 +1155,7 @@ def fig8_gbm_genomic_frequency_by_expression_subtype(
     for feature in features:
         if feature not in merged_cohort.columns:
             continue
-        for subtype in ["Proneural", "Classical", "Mesenchymal", "Mixed/Ambiguous"]:
+        for subtype in ["Classical", "Quasimesenchymal", "Exocrine_Like", "Mixed/Ambiguous"]:
             subgroup = merged_cohort[merged_cohort["PREDICTED_EXPRESSION_SUBTYPE"] == subtype]
             if subgroup.empty:
                 continue
@@ -1174,10 +1174,10 @@ def fig8_gbm_genomic_frequency_by_expression_subtype(
     fig.colorbar(heat, ax=ax)
     ax.set_title("Alteration frequency by predicted expression subtype")
     fig.tight_layout()
-    return save_figure(fig, output_dir, "fig8_gbm_genomic_frequency_by_expression_subtype.png", dpi, overwrite)
+    return save_figure(fig, output_dir, "fig8_PDAC_genomic_frequency_by_expression_subtype.png", dpi, overwrite)
 
 
-def fig9_gbm_burden_by_expression_subtype(
+def fig9_PDAC_burden_by_expression_subtype(
     merged_cohort: pd.DataFrame,
     output_dir: Path,
     dpi: int,
@@ -1187,7 +1187,7 @@ def fig9_gbm_burden_by_expression_subtype(
     fig, axes = plt.subplots(1, 2, figsize=(10, 4.5))
     for ax, variable in zip(axes, ["MUTATION_COUNT", "FGA"]):
         data = []
-        for subtype in ["Proneural", "Classical", "Mesenchymal", "Mixed/Ambiguous"]:
+        for subtype in ["Classical", "Quasimesenchymal", "Exocrine_Like", "Mixed/Ambiguous"]:
             subset = merged_cohort[merged_cohort["PREDICTED_EXPRESSION_SUBTYPE"] == subtype]
             if subset.empty:
                 continue
@@ -1204,10 +1204,10 @@ def fig9_gbm_burden_by_expression_subtype(
         ax.set_ylabel(variable)
     fig.suptitle("Genomic burden by predicted subtype")
     fig.tight_layout()
-    return save_figure(fig, output_dir, "fig9_gbm_burden_by_expression_subtype.png", dpi, overwrite)
+    return save_figure(fig, output_dir, "fig9_PDAC_burden_by_expression_subtype.png", dpi, overwrite)
 
 
-def fig10_gbm_deep_dive_overview(
+def fig10_PDAC_deep_dive_overview(
     merged_cohort: pd.DataFrame,
     output_dir: Path,
     dpi: int,
@@ -1237,62 +1237,62 @@ def fig10_gbm_deep_dive_overview(
     axes[1, 1].text(0.05, 0.15, "- Not a clinically validated classifier", fontsize=11)
     axes[1, 1].axis("off")
 
-    fig.suptitle("GBM deep-dive overview")
+    fig.suptitle("PDAC deep-dive overview")
     fig.tight_layout(rect=[0, 0, 1, 0.96])
-    return save_figure(fig, output_dir, "fig10_gbm_deep_dive_overview.png", dpi, overwrite)
+    return save_figure(fig, output_dir, "fig10_PDAC_deep_dive_overview.png", dpi, overwrite)
 
 
 FIGURE_REGISTRY = {
-    "fig1": fig1_gbm_expression_subtype_summary,
-    "fig2": fig2_gbm_expression_signature_heatmap,
-    "fig3": fig3_gbm_subtype_score_heatmap,
-    "fig4": fig4_gbm_expression_pca,
-    "fig5": fig5_gbm_classification_confidence,
-    "fig6": fig6_gbm_expression_confusion_matrix,
-    "fig8": fig8_gbm_genomic_frequency_by_expression_subtype,
-    "fig9": fig9_gbm_burden_by_expression_subtype,
-    "fig10": fig10_gbm_deep_dive_overview,
+    "fig1": fig1_PDAC_expression_subtype_summary,
+    "fig2": fig2_PDAC_expression_signature_heatmap,
+    "fig3": fig3_PDAC_subtype_score_heatmap,
+    "fig4": fig4_PDAC_expression_pca,
+    "fig5": fig5_PDAC_classification_confidence,
+    "fig6": fig6_PDAC_expression_confusion_matrix,
+    "fig8": fig8_PDAC_genomic_frequency_by_expression_subtype,
+    "fig9": fig9_PDAC_burden_by_expression_subtype,
+    "fig10": fig10_PDAC_deep_dive_overview,
 }
 
 
-def main() -> None: # Runs the pipeline for the GBM deep-dive analysis, including synthetic data generation, subtype classification, survival analysis, genomic enrichment, and figure generation.    
-    """Run the full GBM deep-dive workflow."""
+def main() -> None: # Runs the pipeline for the PDAC deep-dive analysis, including synthetic data generation, subtype classification, survival analysis, genomic enrichment, and figure generation.    
+    """Run the full PDAC deep-dive workflow."""
     args = parse_args()
     output_dir = Path(args.output_dir).resolve()
     ensure_output_directory(output_dir)
 
-    logger.info("Starting GBM deep-dive analysis")
+    logger.info("Starting PDAC deep-dive analysis")
     logger.info("Output directory: %s", output_dir)
 
     cohort = load_cohort(args.input_csv) # 1. Obtain the existing synthetic cohort from generate_figures.py
-    gbm_cohort = filter_gbm_cohort(cohort) # 2. Select only IDH-wildtype GBM cases: 1100 records
-    gbm_cohort = assign_latent_expression_subtype(
-        gbm_cohort,
+    PDAC_cohort = filter_PDAC_cohort(cohort) # 2. Select only IDH-wildtype PDAC cases: 1100 records
+    PDAC_cohort = assign_latent_expression_subtype(
+        PDAC_cohort,
         genomic_enrichment_strength=args.genomic_enrichment_strength,
         mixed_fraction=args.mixed_fraction,
         random_seed=args.seed,
-    ) # Generate synthetic RNA-expression data for the GBM cohort based on the latent subtype labels and specified parameters
+    ) # Generate synthetic RNA-expression data for the PDAC cohort based on the latent subtype labels and specified parameters
 
-    expression_matrix, expression_metadata = generate_synthetic_gbm_expression(
-        gbm_cohort,
-        GBM_EXPRESSION_SIGNATURES,
+    expression_matrix, expression_metadata = generate_synthetic_PDAC_expression(
+        PDAC_cohort,
+        PDAC_EXPRESSION_SIGNATURES,
         random_seed=args.seed,
         subtype_effect_size=args.subtype_effect_size,
         noise_sd=args.noise_sd,
         mixed_fraction=args.mixed_fraction,
         n_background_genes=args.n_background_genes,
-    ) # 3. Generate synthetic bulk RNA-expression data for those GBM samples
+    ) # 3. Generate synthetic bulk RNA-expression data for those PDAC samples
 
-    validate_expression_matrix(expression_matrix, gbm_cohort["SAMPLE_ID"].tolist())
+    validate_expression_matrix(expression_matrix, PDAC_cohort["SAMPLE_ID"].tolist())
     standardized_expression = zscore_expression_by_gene(expression_matrix) # Standardize the expression values by gene (z-score normalization)
 
-    raw_expression_path = save_dataframe_csv(expression_matrix.reset_index(), output_dir, "gbm_synthetic_expression_raw.csv", args.overwrite)
-    zscore_expression_path = save_dataframe_csv(standardized_expression.reset_index(), output_dir, "gbm_synthetic_expression_zscore.csv", args.overwrite)
+    raw_expression_path = save_dataframe_csv(expression_matrix.reset_index(), output_dir, "PDAC_synthetic_expression_raw.csv", args.overwrite)
+    zscore_expression_path = save_dataframe_csv(standardized_expression.reset_index(), output_dir, "PDAC_synthetic_expression_zscore.csv", args.overwrite)
 
-    subtype_scores = calculate_expression_subtype_scores(standardized_expression, GBM_EXPRESSION_SIGNATURES)
-    subtype_scores = subtype_scores.merge(gbm_cohort[["SAMPLE_ID"]], on="SAMPLE_ID", how="left")
+    subtype_scores = calculate_expression_subtype_scores(standardized_expression, PDAC_EXPRESSION_SIGNATURES)
+    subtype_scores = subtype_scores.merge(PDAC_cohort[["SAMPLE_ID"]], on="SAMPLE_ID", how="left")
     subtype_scores = subtype_scores.sort_values("SAMPLE_ID").reset_index(drop=True)
-    subtype_scores_path = save_dataframe_csv(subtype_scores, output_dir, "gbm_expression_subtype_scores.csv", args.overwrite)
+    subtype_scores_path = save_dataframe_csv(subtype_scores, output_dir, "PDAC_expression_subtype_scores.csv", args.overwrite)
 
     classification_df = assign_expression_subtype(
         subtype_scores,
@@ -1300,7 +1300,7 @@ def main() -> None: # Runs the pipeline for the GBM deep-dive analysis, includin
         minimum_top_score=args.minimum_top_score,
     )
 
-    merged_cohort = gbm_cohort.merge(classification_df, on="SAMPLE_ID", how="left", validate="one_to_one")
+    merged_cohort = PDAC_cohort.merge(classification_df, on="SAMPLE_ID", how="left", validate="one_to_one")
     merged_cohort = merged_cohort.merge(
         expression_metadata.drop(columns=["LATENT_EXPRESSION_SUBTYPE"]),
         on="SAMPLE_ID",
@@ -1310,10 +1310,10 @@ def main() -> None: # Runs the pipeline for the GBM deep-dive analysis, includin
 
     # Validate required invariants before plotting.
     if merged_cohort.empty:
-        raise ValueError("The merged GBM cohort is empty.")
+        raise ValueError("The merged PDAC cohort is empty.")
     if merged_cohort["SAMPLE_ID"].duplicated().any():
         raise ValueError("Duplicate SAMPLE_ID values were introduced into the merged table.")
-    if not np.isfinite(merged_cohort[["PRONEURAL_SCORE", "CLASSICAL_SCORE", "MESENCHYMAL_SCORE"]].to_numpy(dtype=float)).all():
+    if not np.isfinite(merged_cohort[["CLASSICAL_SCORE", "QUASIMESENCHYMAL_SCORE", "EXOCRINE_LIKE_SCORE"]].to_numpy(dtype=float)).all():
         raise ValueError("Subtype scores contain non-finite values.")
     if not set(merged_cohort["PREDICTED_EXPRESSION_SUBTYPE"].dropna().unique()).issubset(set(TARGET_SUBTYPES) | {"Mixed/Ambiguous"}):
         raise ValueError("Predicted expression subtype labels contain unexpected values.")
@@ -1324,43 +1324,43 @@ def main() -> None: # Runs the pipeline for the GBM deep-dive analysis, includin
         rng = np.random.default_rng(args.seed + 123)
         merged_cohort = simulate_subtype_survival(merged_cohort, rng)
 
-    save_dataframe_csv(merged_cohort, output_dir, "gbm_deep_dive_cohort.csv", args.overwrite)
-    save_dataframe_csv(gbm_cohort[["SAMPLE_ID", "LATENT_EXPRESSION_SUBTYPE"]], output_dir, "gbm_filtered_cohort.csv", args.overwrite)
+    save_dataframe_csv(merged_cohort, output_dir, "PDAC_deep_dive_cohort.csv", args.overwrite)
+    save_dataframe_csv(PDAC_cohort[["SAMPLE_ID", "LATENT_EXPRESSION_SUBTYPE"]], output_dir, "PDAC_filtered_cohort.csv", args.overwrite)
 
     enrichment_results = run_genomic_enrichment_analysis(merged_cohort, output_dir, args.overwrite)
     _ = evaluate_classification(merged_cohort, output_dir, args.overwrite)
 
     # Generate the requested figure set.
-    fig1_gbm_expression_subtype_summary(merged_cohort, output_dir, args.dpi, args.overwrite)
-    fig2_gbm_expression_signature_heatmap(
+    fig1_PDAC_expression_subtype_summary(merged_cohort, output_dir, args.dpi, args.overwrite)
+    fig2_PDAC_expression_signature_heatmap(
         merged_cohort,
         standardized_expression,
-        GBM_EXPRESSION_SIGNATURES,
+        PDAC_EXPRESSION_SIGNATURES,
         output_dir,
         args.dpi,
         args.overwrite,
         args.max_heatmap_samples,
     )
-    fig3_gbm_subtype_score_heatmap(subtype_scores, output_dir, args.dpi, args.overwrite)
-    fig4_gbm_expression_pca(standardized_expression, merged_cohort, output_dir, args.dpi, args.overwrite)
-    fig5_gbm_classification_confidence(merged_cohort, output_dir, args.dpi, args.overwrite, args.minimum_margin)
-    fig6_gbm_expression_confusion_matrix(merged_cohort, output_dir, args.dpi, args.overwrite)
+    fig3_PDAC_subtype_score_heatmap(subtype_scores, output_dir, args.dpi, args.overwrite)
+    fig4_PDAC_expression_pca(standardized_expression, merged_cohort, output_dir, args.dpi, args.overwrite)
+    fig5_PDAC_classification_confidence(merged_cohort, output_dir, args.dpi, args.overwrite, args.minimum_margin)
+    fig6_PDAC_expression_confusion_matrix(merged_cohort, output_dir, args.dpi, args.overwrite)
     run_survival_analysis(merged_cohort, args.simulate_subtype_survival, output_dir, args.overwrite, args.dpi)
-    fig8_gbm_genomic_frequency_by_expression_subtype(merged_cohort, output_dir, args.dpi, args.overwrite)
-    fig9_gbm_burden_by_expression_subtype(merged_cohort, output_dir, args.dpi, args.overwrite)
-    fig10_gbm_deep_dive_overview(merged_cohort, output_dir, args.dpi, args.overwrite)
+    fig8_PDAC_genomic_frequency_by_expression_subtype(merged_cohort, output_dir, args.dpi, args.overwrite)
+    fig9_PDAC_burden_by_expression_subtype(merged_cohort, output_dir, args.dpi, args.overwrite)
+    fig10_PDAC_deep_dive_overview(merged_cohort, output_dir, args.dpi, args.overwrite)
 
     summary_counts = make_summary_counts(merged_cohort)
-    save_dataframe_csv(summary_counts, output_dir, "gbm_expression_subtype_summary.csv", args.overwrite)
+    save_dataframe_csv(summary_counts, output_dir, "PDAC_expression_subtype_summary.csv", args.overwrite)
 
     metadata = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "program_version": PROGRAM_VERSION,
         "random_seed": args.seed,
         "original_cohort_rows": int(len(cohort)),
-        "gbm_rows": int(len(gbm_cohort)),
+        "PDAC_rows": int(len(PDAC_cohort)),
         "expression_genes": int(standardized_expression.shape[1]),
-        "signature_genes": {key: len(value) for key, value in GBM_EXPRESSION_SIGNATURES.items()},
+        "signature_genes": {key: len(value) for key, value in PDAC_EXPRESSION_SIGNATURES.items()},
         "simulation_parameters": {
             "subtype_effect_size": args.subtype_effect_size,
             "noise_sd": args.noise_sd,
@@ -1377,22 +1377,22 @@ def main() -> None: # Runs the pipeline for the GBM deep-dive analysis, includin
             "raw_expression": str(raw_expression_path),
             "zscore_expression": str(zscore_expression_path),
             "subtype_scores": str(subtype_scores_path),
-            "merged_cohort": str(output_dir / "gbm_deep_dive_cohort.csv"),
-            "enrichment_results": str(output_dir / "gbm_genomic_enrichment_results.csv"),
-            "survival_summary": str(output_dir / "gbm_survival_summary.csv"),
-            "classification_metrics": str(output_dir / "gbm_classification_metrics.csv"),
+            "merged_cohort": str(output_dir / "PDAC_deep_dive_cohort.csv"),
+            "enrichment_results": str(output_dir / "PDAC_genomic_enrichment_results.csv"),
+            "survival_summary": str(output_dir / "PDAC_survival_summary.csv"),
+            "classification_metrics": str(output_dir / "PDAC_classification_metrics.csv"),
         },
         "simulate_subtype_survival": bool(args.simulate_subtype_survival),
         "synthetic_note": "This pipeline uses synthetic data and should not be interpreted as a clinical diagnostic classifier.",
     }
-    save_json(metadata, output_dir, "gbm_run_metadata.json", args.overwrite)
+    save_json(metadata, output_dir, "PDAC_run_metadata.json", args.overwrite)
 
     logger.info("Original cohort rows: %d", len(cohort))
-    logger.info("IDH-wildtype GBM rows: %d", len(gbm_cohort))
+    logger.info("IDH-wildtype PDAC rows: %d", len(PDAC_cohort))
     logger.info("Expression genes generated: %d", standardized_expression.shape[1])
-    logger.info("Predicted Proneural: %d", int((merged_cohort["PREDICTED_EXPRESSION_SUBTYPE"] == "Proneural").sum()))
     logger.info("Predicted Classical: %d", int((merged_cohort["PREDICTED_EXPRESSION_SUBTYPE"] == "Classical").sum()))
-    logger.info("Predicted Mesenchymal: %d", int((merged_cohort["PREDICTED_EXPRESSION_SUBTYPE"] == "Mesenchymal").sum()))
+    logger.info("Predicted Quasimesenchymal: %d", int((merged_cohort["PREDICTED_EXPRESSION_SUBTYPE"] == "Quasimesenchymal").sum()))
+    logger.info("Predicted Exocrine_Like: %d", int((merged_cohort["PREDICTED_EXPRESSION_SUBTYPE"] == "Exocrine_Like").sum()))
     logger.info("Predicted Mixed/Ambiguous: %d", int((merged_cohort["PREDICTED_EXPRESSION_SUBTYPE"] == "Mixed/Ambiguous").sum()))
     logger.info("Figures generated: 10")
     logger.info("Output directory: %s", output_dir)
