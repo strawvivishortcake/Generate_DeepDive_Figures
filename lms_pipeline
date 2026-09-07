@@ -1,0 +1,828 @@
+"""Synthetic LMS deep-dive figure pipeline for educational and research prototyping.
+
+This script extends the existing synthetic glioma cohort by creating a focused
+Leiomyosarcoma (LMS) analysis. It generates synthetic bulk RNA-expression data,
+classifies tumors into transcriptional subtype groups, validates the synthetic
+classification against hidden generator labels, and produces a comprehensive set
+of figures and result tables.
+
+Scientific note:
+- The pipeline is intentionally synthetic and educational.
+- It is not a clinically validated diagnostic classifier.
+- The built-in expression signatures are teaching-oriented and should be replaced
+in a real study with published, validated signatures.
+- Bulk RNA expression is modeled as a coarse average over tumor cells and the
+tumor microenvironment."""
+
+from __future__ import annotations
+import argparse
+import json
+import logging
+import re
+import warnings
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch
+from matplotlib.ticker import PercentFormatter
+from matplotlib.colors import LinearSegmentedColormap
+import matplotlib.lines as mlines
+from scipy.stats import mannwhitneyu, chi2_contingency, fisher_exact, wilcoxon
+from statsmodels.stats.multitest import multipletests
+from statsmodels.stats.proportion import proportion_confint
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+from lifelines import KaplanMeierFitter, CoxPHFitter
+from lifelines.statistics import logrank_test, proportional_hazard_test
+from lifelines.utils import k_fold_cross_validation
+warnings.filterwarnings('ignore')
+logger = logging.getLogger('LMS_display_items')
+logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
+PROGRAM_VERSION = '2.0.0'
+MIN_SITE_N_TO_MODEL = 20
+COLOR_A = '#636363'
+COLOR_B = '#3182bd'
+COLOR_SIG = '#e6550d'
+COLOR_NS = '#969696'
+COLOR_PRIMARY = '#3182bd'
+COLOR_METASTASIS = '#e6550d'
+PALETTE = {'HLA-I intact': COLOR_A, 'HLA-I LOH': COLOR_B}
+MARKER = {'HLA-I intact': 'o', 'HLA-I LOH': '^'}
+PANEL_LABEL_FONTSIZE = 15
+DIVERGING_CMAP = LinearSegmentedColormap.from_list('blue_white_orange', ['#2166ac', '#f7f7f7', '#e6550d'])
+
+def style_axis(ax) -> None:
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(False)
+
+def panel_label(ax, letter: str) -> None:
+    ax.text(-0.16, 1.08, letter, transform=ax.transAxes, fontsize=PANEL_LABEL_FONTSIZE, fontweight='bold', va='bottom', ha='left')
+
+def bottom_legend(fig, handles, labels, ncol: Optional[int]=None, y: float=-0.02) -> None:
+    fig.legend(handles, labels, loc='lower center', ncol=ncol or len(labels), frameon=False, bbox_to_anchor=(0.5, y))
+
+def add_sig_bracket(ax, x1: float, x2: float, y: float, height: float, text: str) -> None:
+    ax.plot([x1, x1, x2, x2], [y, y + height, y + height, y], color='black', linewidth=1)
+    ax.text((x1 + x2) / 2, y + height, text, ha='center', va='bottom', fontsize=9)
+
+def draw_flow_box(ax, x: float, y: float, w: float, h: float, text: str, facecolor: str='white') -> None:
+    box = FancyBboxPatch((x - w / 2, y - h / 2), w, h, boxstyle='round,pad=0.012', linewidth=1.2, edgecolor='black', facecolor=facecolor)
+    ax.add_patch(box)
+    ax.text(x, y, text, ha='center', va='center', fontsize=9)
+
+def draw_flow_arrow(ax, x1: float, y1: float, x2: float, y2: float) -> None:
+    ax.annotate('', xy=(x2, y2), xytext=(x1, y1), arrowprops=dict(arrowstyle='-|>', color='grey', lw=1.2))
+
+def finalize_figure(fig, output_dir: Path, filename: str, dpi: int, overwrite: bool, rect: Tuple[float, float, float, float]=(0, 0, 1, 1)) -> Path:
+    fig.tight_layout(rect=rect)
+    return save_fig(fig, output_dir, filename, dpi, overwrite)
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description='Generate real-data LMS HLA-I LOH main + supplementary display items')
+    parser.add_argument('--input-tsv', type=str, default='msk_impact_lms_clinical_data.tsv')
+    parser.add_argument('--output-dir', type=str, default='figures/LMS_deep_dive')
+    parser.add_argument('--min-site-n', type=int, default=MIN_SITE_N_TO_MODEL, help='Minimum number of patients positive for a metastatic site before it is regression-modeled')
+    parser.add_argument('--dpi', type=int, default=300)
+    parser.add_argument('--overwrite', action='store_true')
+    return parser.parse_args()
+
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+def resolve_path(output_dir: Path, filename: str, overwrite: bool) -> Path:
+    path = output_dir / filename
+    if path.exists() and (not overwrite):
+        raise FileExistsError(f'Refusing to overwrite {path}. Re-run with --overwrite.')
+    return path
+
+def save_csv(df: pd.DataFrame, output_dir: Path, filename: str, overwrite: bool) -> Path:
+    path = resolve_path(output_dir, filename, overwrite)
+    df.to_csv(path, index=False)
+    logger.info('Saved %s', path)
+    return path
+
+def save_json(data: Dict, output_dir: Path, filename: str, overwrite: bool) -> Path:
+    path = resolve_path(output_dir, filename, overwrite)
+    with path.open('w') as f:
+        json.dump(data, f, indent=2, sort_keys=True, default=str)
+    logger.info('Saved %s', path)
+    return path
+
+def save_fig(fig, output_dir: Path, filename: str, dpi: int, overwrite: bool) -> Path:
+    path = resolve_path(output_dir, filename, overwrite)
+    fig.savefig(path, dpi=dpi, bbox_inches='tight')
+    plt.close(fig)
+    logger.info('Saved %s', path)
+    return path
+
+def smd_continuous(x1: pd.Series, x2: pd.Series) -> float:
+    x1 = x1.dropna().astype(float)
+    x2 = x2.dropna().astype(float)
+    if len(x1) < 2 or len(x2) < 2:
+        return np.nan
+    pooled_sd = np.sqrt((x1.var(ddof=1) + x2.var(ddof=1)) / 2.0)
+    if pooled_sd <= 1e-12:
+        return np.nan
+    return float(abs(x1.mean() - x2.mean()) / pooled_sd)
+
+def smd_binary(p1: float, n1: int, p2: float, n2: int) -> float:
+    if n1 < 2 or n2 < 2 or np.isnan(p1) or np.isnan(p2):
+        return np.nan
+    pooled_var = (p1 * (1 - p1) + p2 * (1 - p2)) / 2.0
+    if pooled_var <= 1e-12:
+        return np.nan
+    return float(abs(p1 - p2) / np.sqrt(pooled_var))
+
+def median_iqr(series: pd.Series, ndigits: int=1) -> str:
+    s = series.dropna().astype(float)
+    if s.empty:
+        return 'NA'
+    q1, med, q3 = s.quantile([0.25, 0.5, 0.75])
+    return f'{med:.{ndigits}f} ({q1:.{ndigits}f}-{q3:.{ndigits}f})'
+
+def n_pct(count: int, total: int, ndigits: int=1) -> str:
+    if total == 0:
+        return 'NA'
+    return f'{count} ({100 * count / total:.{ndigits}f}%)'
+
+def wilson_ci(count: int, total: int) -> Tuple[float, float, float]:
+    if total == 0:
+        return (np.nan, np.nan, np.nan)
+    prop = count / total
+    lo, hi = proportion_confint(count, total, method='wilson')
+    return (prop, lo, hi)
+
+def load_raw(path: Path) -> pd.DataFrame:
+    raw = pd.read_csv(path, sep='\t')
+    cancer_types = raw['Cancer Type Detailed'].dropna().unique().tolist()
+    logger.info('Loaded %d sample rows. Cancer Type Detailed values present: %s', len(raw), cancer_types)
+    if not any(('Leiomyosarcoma' in str(v) for v in cancer_types)):
+        raise ValueError("No 'Leiomyosarcoma' records found in 'Cancer Type Detailed'. This pipeline expects a leiomyosarcoma clinical export.")
+    return raw
+
+def _sample_order(sample_id: str) -> int:
+    match = re.search('-T0?(\\d+)-', str(sample_id))
+    return int(match.group(1)) if match else 99
+
+def build_patient_level_cohort(raw: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    df = raw[raw['Cancer Type Detailed'] == 'Leiomyosarcoma'].copy()
+    flow: Dict[str, int] = {'n_sample_rows_LMS': int(len(df))}
+    df['_order'] = df['Sample ID'].apply(_sample_order)
+    site_agg = df.groupby('Patient ID')['Metastatic Site'].apply(lambda s: sorted(set((v for v in s.dropna().astype(str))))).rename('RECORDED_METASTATIC_SITES')
+    df_sorted = df.sort_values(['Patient ID', '_order'])
+    index_samples = df_sorted.groupby('Patient ID', as_index=False).first()
+    index_samples = index_samples.merge(site_agg, on='Patient ID', how='left')
+    index_samples['N_RECORDED_METASTATIC_SITES'] = index_samples['RECORDED_METASTATIC_SITES'].apply(len)
+    index_samples['HAS_RECORDED_METASTATIC_SITE'] = index_samples['N_RECORDED_METASTATIC_SITES'] > 0
+    flow['n_patients_LMS'] = int(len(index_samples))
+    logger.info('Collapsed to %d unique LMS patients (index sample = first sequenced).', len(index_samples))
+    return (index_samples, flow)
+
+def annotate_hla_loh(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    loh_cols = ['HLA-A Allele 1 LOH Status', 'HLA-A Allele 2 LOH Status', 'HLA-B Allele 1 LOH Status', 'HLA-B Allele 2 LOH Status', 'HLA-C Allele 1 LOH Status', 'HLA-C Allele 2 LOH Status']
+    evaluable = df['HLA Genotype Available'].fillna(False) & df[loh_cols].notna().all(axis=1)
+    any_loss = (df[loh_cols] == 'Loss').any(axis=1)
+    hla_status = pd.Series(np.nan, index=df.index, dtype=object)
+    hla_status[evaluable & any_loss] = 'HLA-I LOH'
+    hla_status[evaluable & ~any_loss] = 'HLA-I intact'
+    df['HLA_I_LOH_STATUS'] = hla_status
+    df['HLA_I_EVALUABLE'] = evaluable
+    return df
+
+def build_analysis_cohort(index_samples: pd.DataFrame, flow: Dict[str, int]) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    df = index_samples.copy()
+    n0 = len(df)
+    df = df[df['FACETS QC'] == 'Pass'].copy()
+    flow['dropped_facets_qc_fail_or_missing'] = int(n0 - len(df))
+    df = annotate_hla_loh(df)
+    n1 = len(df)
+    df = df[df['HLA_I_EVALUABLE']].copy()
+    flow['dropped_hla_not_evaluable'] = int(n1 - len(df))
+    n2 = len(df)
+    base_covariates = ['Age at Diagnosis', 'Sex', 'Fraction Genome Altered', 'TMB Score']
+    df = df.dropna(subset=base_covariates).copy()
+    flow['dropped_missing_base_covariates'] = int(n2 - len(df))
+    flow['n_analysis_cohort'] = int(len(df))
+    logger.info('Analysis cohort after QC/evaluability/covariate filters: n=%d', len(df))
+    df = df.rename(columns={'Age at Diagnosis': 'AGE', 'Sex': 'SEX', 'Fraction Genome Altered': 'FGA', 'TMB Score': 'TMB', 'Mutation Count': 'MUTATION_COUNT', 'MSI Score': 'MSI_SCORE', 'MSI Type': 'MSI_TYPE', 'Sample Type': 'SAMPLE_TYPE', 'Disease Status': 'DISEASE_STATUS', 'Gene Panel': 'GENE_PANEL', 'Overall Survival (Months)': 'OS_TIME', 'Overall Survival Status': 'OS_STATUS_RAW', 'Genetic Ancestry': 'GENETIC_ANCESTRY'})
+    df['OS_EVENT'] = df['OS_STATUS_RAW'].apply(lambda v: 1 if 'DECEASED' in str(v) else 0 if 'LIVING' in str(v) else np.nan)
+    df['OS_TIME'] = pd.to_numeric(df['OS_TIME'], errors='coerce')
+    return (df, flow)
+
+def build_survival_subset(cohort: pd.DataFrame, flow: Dict[str, int]) -> pd.DataFrame:
+    n0 = len(cohort)
+    surv = cohort.dropna(subset=['OS_TIME', 'OS_EVENT']).copy()
+    surv = surv[surv['OS_TIME'] > 0].copy()
+    flow['dropped_missing_or_invalid_survival'] = int(n0 - len(surv))
+    flow['n_survival_cohort'] = int(len(surv))
+    return surv
+
+def prep_model_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df['HLA_LOH_bin'] = (df['HLA_I_LOH_STATUS'] == 'HLA-I LOH').astype(int)
+    df['SEX_bin'] = (df['SEX'] == 'Female').astype(int)
+    df['PANEL_468_bin'] = (df['GENE_PANEL'] == 'IMPACT468').astype(int)
+    df['MET_ORIGIN_bin'] = (df['SAMPLE_TYPE'] == 'Metastasis').astype(int)
+    european = {'nonASJ-EUR', 'ASJ-EUR'}
+    df['NON_EUROPEAN_ANCESTRY_bin'] = (~df['GENETIC_ANCESTRY'].isin(european)).astype(int)
+    return df
+
+def build_table1(cohort: pd.DataFrame) -> pd.DataFrame:
+    groups = {'Overall': cohort, 'HLA-I intact': cohort[cohort['HLA_I_LOH_STATUS'] == 'HLA-I intact'], 'HLA-I LOH': cohort[cohort['HLA_I_LOH_STATUS'] == 'HLA-I LOH']}
+    intact, loh = (groups['HLA-I intact'], groups['HLA-I LOH'])
+    rows: List[Dict] = []
+
+    def add_continuous_row(label: str, col: str):
+        row = {'Characteristic': label}
+        for gname, gdf in groups.items():
+            row[gname] = median_iqr(gdf[col])
+        row['SMD'] = round(smd_continuous(intact[col], loh[col]), 2) if len(intact) and len(loh) else np.nan
+        rows.append(row)
+
+    def add_binary_row(label: str, mask_fn):
+        row = {'Characteristic': label}
+        for gname, gdf in groups.items():
+            row[gname] = n_pct(int(mask_fn(gdf).sum()), len(gdf))
+        p_intact = mask_fn(intact).sum() / len(intact) if len(intact) else np.nan
+        p_loh = mask_fn(loh).sum() / len(loh) if len(loh) else np.nan
+        row['SMD'] = round(smd_binary(p_intact, len(intact), p_loh, len(loh)), 2) if len(intact) and len(loh) else np.nan
+        rows.append(row)
+    rows.append({'Characteristic': 'Patients, n', 'Overall': len(groups['Overall']), 'HLA-I intact': len(intact), 'HLA-I LOH': len(loh), 'SMD': '-'})
+    add_continuous_row('Age at diagnosis, years', 'AGE')
+    add_continuous_row('TMB, mutations/Mb', 'TMB')
+    add_continuous_row('FGA', 'FGA')
+    add_continuous_row('Mutation count', 'MUTATION_COUNT')
+    add_continuous_row('Recorded metastatic sites, n', 'N_RECORDED_METASTATIC_SITES')
+    add_binary_row('Female sex', lambda d: d['SEX'] == 'Female')
+    add_binary_row('Metastatic-origin specimen', lambda d: d['SAMPLE_TYPE'] == 'Metastasis')
+    add_binary_row('IMPACT468 panel', lambda d: d['GENE_PANEL'] == 'IMPACT468')
+    add_binary_row('Any recorded metastatic site', lambda d: d['HAS_RECORDED_METASTATIC_SITE'])
+    add_binary_row('MSI-instable (of typed)', lambda d: d['MSI_TYPE'] == 'Instable')
+    return pd.DataFrame(rows)
+
+def continuous_group_test(cohort: pd.DataFrame, col: str) -> Tuple[float, float]:
+    intact = cohort.loc[cohort['HLA_I_LOH_STATUS'] == 'HLA-I intact', col].dropna()
+    loh = cohort.loc[cohort['HLA_I_LOH_STATUS'] == 'HLA-I LOH', col].dropna()
+    if len(intact) < 2 or len(loh) < 2:
+        return (np.nan, np.nan)
+    stat, p = mannwhitneyu(intact, loh, alternative='two-sided')
+    return (float(stat), float(p))
+
+def site_burden_model(cohort: pd.DataFrame, extra_covariates: Optional[List[str]]=None) -> Optional[Dict]:
+    covariates = ['FGA', 'TMB', 'AGE', 'SEX_bin'] + (extra_covariates or [])
+    model_df = cohort.dropna(subset=['N_RECORDED_METASTATIC_SITES', 'HLA_LOH_bin'] + covariates).copy()
+    formula = 'N_RECORDED_METASTATIC_SITES ~ HLA_LOH_bin + ' + ' + '.join(covariates)
+    fitted, model_family = (None, None)
+    try:
+        nb_model = smf.negativebinomial(formula, data=model_df).fit(disp=False, maxiter=300)
+        if np.isfinite(nb_model.bse).all():
+            fitted, model_family = (nb_model, 'negative_binomial')
+        else:
+            logger.warning('Negative-binomial model produced non-finite SEs (near-zero overdispersion for this variable); falling back to a Poisson GLM with HC3-robust SE.')
+    except Exception as exc:
+        logger.warning('Negative-binomial site-burden model failed to fit (%s); falling back to Poisson/HC3.', exc)
+    if fitted is None:
+        try:
+            fitted = smf.glm(formula, data=model_df, family=sm.families.Poisson()).fit(cov_type='HC3')
+            model_family = 'poisson_HC3_robust'
+        except Exception as exc:
+            logger.warning('Poisson fallback model also failed to fit: %s', exc)
+            return None
+    result = {'n': int(len(model_df)), 'model_family': model_family, 'terms': ['HLA_LOH_bin'] + covariates}
+    for term in result['terms']:
+        beta, se, p = (fitted.params.get(term, np.nan), fitted.bse.get(term, np.nan), fitted.pvalues.get(term, np.nan))
+        result[f'{term}_RR'] = float(np.exp(beta))
+        result[f'{term}_RR_lo'] = float(np.exp(beta - 1.96 * se))
+        result[f'{term}_RR_hi'] = float(np.exp(beta + 1.96 * se))
+        result[f'{term}_p'] = float(p)
+    return result
+
+def fit_cox(surv_cohort: pd.DataFrame, extra_covariates: Optional[List[str]]=None) -> Tuple[Optional[CoxPHFitter], Optional[pd.DataFrame]]:
+    covariates = ['FGA', 'TMB', 'AGE', 'SEX_bin'] + (extra_covariates or [])
+    df = surv_cohort.dropna(subset=['OS_TIME', 'OS_EVENT', 'HLA_LOH_bin'] + covariates).copy()
+    if len(df) < 20:
+        return (None, None)
+    cox_df = df[['OS_TIME', 'OS_EVENT', 'HLA_LOH_bin'] + covariates].copy()
+    cph = CoxPHFitter()
+    cph.fit(cox_df, duration_col='OS_TIME', event_col='OS_EVENT', robust=True)
+    return (cph, cox_df)
+
+def cox_summary_dict(cph: CoxPHFitter, cox_df: pd.DataFrame, term: str='HLA_LOH_bin') -> Dict:
+    s = cph.summary
+    return {'n': int(len(cox_df)), 'n_events': int(cox_df['OS_EVENT'].sum()), 'HR': float(np.exp(s.loc[term, 'coef'])), 'HR_lo': float(np.exp(s.loc[term, 'coef lower 95%'])), 'HR_hi': float(np.exp(s.loc[term, 'coef upper 95%'])), 'p': float(s.loc[term, 'p'])}
+
+def site_specific_logistic_models(cohort: pd.DataFrame, sites: List[str], min_n: int) -> pd.DataFrame:
+    rows = []
+    model_df = cohort.dropna(subset=['HLA_LOH_bin', 'FGA', 'TMB', 'AGE', 'SEX_bin']).copy()
+    for site in sites:
+        model_df[f'has_{site}'] = model_df['RECORDED_METASTATIC_SITES'].apply(lambda lst: site in lst)
+        n_pos = int(model_df[f'has_{site}'].sum())
+        row = {'SITE': site, 'N_POSITIVE': n_pos, 'N_TOTAL': int(len(model_df))}
+        if n_pos < min_n:
+            row.update({'MODELED': False, 'OR': np.nan, 'OR_lo': np.nan, 'OR_hi': np.nan, 'P': np.nan})
+            rows.append(row)
+            continue
+        try:
+            logit = smf.glm(f'has_{site} ~ HLA_LOH_bin + FGA + TMB + AGE + SEX_bin', data=model_df, family=sm.families.Binomial()).fit(cov_type='HC3')
+            beta, se, p = (logit.params['HLA_LOH_bin'], logit.bse['HLA_LOH_bin'], logit.pvalues['HLA_LOH_bin'])
+            row.update({'MODELED': True, 'OR': float(np.exp(beta)), 'OR_lo': float(np.exp(beta - 1.96 * se)), 'OR_hi': float(np.exp(beta + 1.96 * se)), 'P': float(p)})
+        except Exception as exc:
+            logger.warning("Logistic model for site '%s' failed: %s", site, exc)
+            row.update({'MODELED': False, 'OR': np.nan, 'OR_lo': np.nan, 'OR_hi': np.nan, 'P': np.nan})
+        rows.append(row)
+    result = pd.DataFrame(rows)
+    modeled = result['MODELED']
+    result['FDR_Q'] = np.nan
+    if modeled.any():
+        result.loc[modeled, 'FDR_Q'] = multipletests(result.loc[modeled, 'P'], method='fdr_bh')[1]
+    return result
+
+def build_table2(cohort: pd.DataFrame, surv_cohort: pd.DataFrame, min_site_n: int) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    rows = []
+    for col, name in [('FGA', 'FGA'), ('TMB', 'TMB'), ('N_RECORDED_METASTATIC_SITES', 'Recorded site count')]:
+        _, p = continuous_group_test(cohort, col)
+        domain = 'Metastatic-site burden' if 'site' in name.lower() else 'Genomic burden'
+        rows.append({'Domain': domain, 'Estimand': f'{name} (HLA-I LOH vs intact)', 'Test': 'Mann-Whitney U', 'P': p, 'n': len(cohort)})
+    nb = site_burden_model(cohort)
+    if nb is not None:
+        model_label = 'Negative-binomial' if nb['model_family'] == 'negative_binomial' else 'Poisson (HC3-robust; NB did not converge)'
+        rows.append({'Domain': 'Metastatic-site burden (adjusted)', 'Estimand': 'HLA-I LOH', 'Test': f'{model_label}, RR (95% CI)', 'Effect': f'RR {nb['HLA_LOH_bin_RR']:.2f} ({nb['HLA_LOH_bin_RR_lo']:.2f}-{nb['HLA_LOH_bin_RR_hi']:.2f})', 'P': nb['HLA_LOH_bin_p'], 'n': nb['n']})
+    intact = surv_cohort[surv_cohort['HLA_I_LOH_STATUS'] == 'HLA-I intact']
+    loh = surv_cohort[surv_cohort['HLA_I_LOH_STATUS'] == 'HLA-I LOH']
+    if len(intact) >= 5 and len(loh) >= 5:
+        lr = logrank_test(intact['OS_TIME'], loh['OS_TIME'], event_observed_A=intact['OS_EVENT'], event_observed_B=loh['OS_EVENT'])
+        rows.append({'Domain': 'Overall survival', 'Estimand': 'HLA-I LOH (unadjusted log-rank)', 'Test': 'Log-rank', 'P': float(lr.p_value), 'n': int(len(intact) + len(loh))})
+    cph, cox_df = fit_cox(surv_cohort)
+    cox_result = cox_summary_dict(cph, cox_df) if cph is not None else None
+    if cox_result is not None:
+        rows.append({'Domain': 'Overall survival (adjusted)', 'Estimand': 'HLA-I LOH', 'Test': 'Cox PH, robust SE, HR (95% CI)', 'Effect': f'HR {cox_result['HR']:.2f} ({cox_result['HR_lo']:.2f}-{cox_result['HR_hi']:.2f})', 'P': cox_result['p'], 'n': cox_result['n']})
+    table2 = pd.DataFrame(rows)
+    table2['P'] = pd.to_numeric(table2['P'], errors='coerce')
+    all_sites = sorted(set((s for lst in cohort['RECORDED_METASTATIC_SITES'] for s in lst)))
+    n_with_data = len(cohort)
+    site_rows = []
+    for site in all_sites:
+        count = int(cohort['RECORDED_METASTATIC_SITES'].apply(lambda lst: site in lst).sum())
+        prop, lo, hi = wilson_ci(count, n_with_data)
+        site_rows.append({'SITE': site, 'N': count, 'N_TOTAL': n_with_data, 'PERCENT': round(prop * 100, 1) if not np.isnan(prop) else np.nan, 'WILSON_CI_LOW': round(lo * 100, 1) if not np.isnan(lo) else np.nan, 'WILSON_CI_HIGH': round(hi * 100, 1) if not np.isnan(hi) else np.nan, 'MODELED': count >= min_site_n})
+    site_freq_table = pd.DataFrame(site_rows).sort_values('N', ascending=False).reset_index(drop=True)
+    sites_to_model = site_freq_table.loc[site_freq_table['MODELED'], 'SITE'].tolist()
+    site_model_table = site_specific_logistic_models(cohort, sites_to_model, min_site_n) if sites_to_model else pd.DataFrame()
+    return (table2, site_freq_table, site_model_table)
+
+def fig1_cohort_and_sites(cohort: pd.DataFrame, flow: Dict[str, int], site_freq_table: pd.DataFrame, output_dir: Path, dpi: int, overwrite: bool) -> Path:
+    fig = plt.figure(figsize=(13, 9))
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.3, 1])
+    ax_flow = fig.add_subplot(gs[0, :])
+    ax_flow.axis('off')
+    ax_flow.set_xlim(0, 1)
+    ax_flow.set_ylim(0, 1)
+    panel_label(ax_flow, 'a')
+    chain = [(0.15, 0.9, f'{flow.get('n_sample_rows_LMS', '?')} LMS sample rows'), (0.15, 0.72, f'{flow.get('n_patients_LMS', '?')} unique patients'), (0.15, 0.54, f'FACETS QC pass\nn = {flow.get('n_patients_LMS', 0) - flow.get('dropped_facets_qc_fail_or_missing', 0)}'), (0.15, 0.36, f'HLA-I LOH evaluable\nn = {flow.get('n_analysis_cohort', 0) + flow.get('dropped_missing_base_covariates', 0)}'), (0.15, 0.18, f'Complete base covariates\nn = {flow.get('n_analysis_cohort', '?')}')]
+    for x, y, text in chain:
+        draw_flow_box(ax_flow, x, y, 0.24, 0.13, text)
+    for i in range(len(chain) - 1):
+        draw_flow_arrow(ax_flow, chain[i][0], chain[i][1] - 0.065, chain[i + 1][0], chain[i + 1][1] + 0.065)
+    draw_flow_arrow(ax_flow, chain[-1][0], chain[-1][1] - 0.065, 0.45, 0.09)
+    draw_flow_arrow(ax_flow, chain[-1][0], chain[-1][1] - 0.065, 0.75, 0.09)
+    draw_flow_box(ax_flow, 0.45, 0.09, 0.26, 0.13, f'Site/burden model\nn = {flow.get('n_analysis_cohort', '?')}', facecolor='#c6dbef')
+    draw_flow_box(ax_flow, 0.75, 0.09, 0.26, 0.13, f'Survival model\nn = {flow.get('n_survival_cohort', '?')}')
+    ax_dist = fig.add_subplot(gs[1, 0])
+    panel_label(ax_dist, 'b')
+    for status, color in PALETTE.items():
+        vals = cohort.loc[cohort['HLA_I_LOH_STATUS'] == status, 'N_RECORDED_METASTATIC_SITES']
+        if vals.empty:
+            continue
+        counts = vals.value_counts(normalize=True).sort_index() * 100
+        ax_dist.plot(counts.index, counts.values, marker=MARKER[status], color=color, label=f'{status} (n={len(vals)})')
+    ax_dist.set_xlabel('Recorded metastatic sites (n)')
+    ax_dist.set_ylabel('Patients (%)')
+    style_axis(ax_dist)
+    ax_site = fig.add_subplot(gs[1, 1])
+    panel_label(ax_site, 'c')
+    top = site_freq_table.head(15).iloc[::-1]
+    y = np.arange(len(top))
+    colors = [COLOR_B if m else COLOR_NS for m in top['MODELED']]
+    ax_site.errorbar(top['PERCENT'], y, xerr=[top['PERCENT'] - top['WILSON_CI_LOW'], top['WILSON_CI_HIGH'] - top['PERCENT']], fmt='none', ecolor='black', capsize=3, zorder=1)
+    ax_site.scatter(top['PERCENT'], y, c=colors, s=45, zorder=2)
+    ax_site.set_yticks(y)
+    ax_site.set_yticklabels([f'{s} (n={n})' for s, n in zip(top['SITE'], top['N'])], fontsize=9)
+    ax_site.set_xlabel('Patients with recorded site (%, 95% CI)')
+    style_axis(ax_site)
+    handles = [mlines.Line2D([], [], color=c, marker=MARKER[s], linestyle='-', label=s) for s, c in PALETTE.items()]
+    bottom_legend(fig, handles, [h.get_label() for h in handles])
+    return finalize_figure(fig, output_dir, 'fig1_LMS_cohort_and_sites.png', dpi, overwrite, rect=(0, 0.03, 1, 1))
+
+def fig2_burden_boxplots(cohort: pd.DataFrame, nb_result: Optional[Dict], output_dir: Path, dpi: int, overwrite: bool) -> Path:
+    fig, axes = plt.subplots(1, 3, figsize=(14, 5))
+    intact_n = int((cohort['HLA_I_LOH_STATUS'] == 'HLA-I intact').sum())
+    loh_n = int((cohort['HLA_I_LOH_STATUS'] == 'HLA-I LOH').sum())
+    for ax, letter, col, ylabel in zip(axes[:2], ['a', 'b'], ['FGA', 'TMB'], ['Fraction genome altered', 'TMB (mutations per Mb)']):
+        panel_label(ax, letter)
+        data = [cohort.loc[cohort['HLA_I_LOH_STATUS'] == s, col].dropna().values for s in ['HLA-I intact', 'HLA-I LOH']]
+        bp = ax.boxplot(data, patch_artist=True, widths=0.5, showfliers=False)
+        for patch, color in zip(bp['boxes'], PALETTE.values()):
+            patch.set_facecolor(color)
+        for median in bp['medians']:
+            median.set_color('black')
+        ax.set_xticklabels([f'HLA-I intact\nn = {intact_n}', f'HLA-I LOH\nn = {loh_n}'])
+        ax.set_ylabel(ylabel)
+        _, p = continuous_group_test(cohort, col)
+        top = max((v.max() for v in data if len(v)))
+        add_sig_bracket(ax, 1, 2, top * 1.03, top * 0.04, f'P = {p:.3g}' if not np.isnan(p) else 'P = NA')
+        ax.set_ylim(top=top * 1.18)
+        style_axis(ax)
+    ax = axes[2]
+    panel_label(ax, 'c')
+    if nb_result is not None:
+        terms = nb_result['terms']
+        labels = {'HLA_LOH_bin': 'HLA-I LOH', 'FGA': 'FGA', 'TMB': 'TMB', 'AGE': 'Age', 'SEX_bin': 'Female sex'}
+        display_labels = [labels.get(t, t) for t in terms]
+        ys = np.arange(len(terms))[::-1]
+        rrs = np.array([nb_result[f'{t}_RR'] for t in terms])
+        los = np.array([nb_result[f'{t}_RR_lo'] for t in terms])
+        his = np.array([nb_result[f'{t}_RR_hi'] for t in terms])
+        ps = np.array([nb_result[f'{t}_p'] for t in terms])
+        colors = [COLOR_SIG if p < 0.05 else COLOR_NS for p in ps]
+        for xi, yi, loi, hii, ci in zip(rrs, ys, los, his, colors):
+            ax.errorbar([xi], [yi], xerr=[[xi - loi], [hii - xi]], fmt='none', ecolor=ci, capsize=3, zorder=1)
+        ax.scatter(rrs, ys, c=colors, s=45, zorder=2)
+        ax.axvline(1.0, color='grey', linestyle='--')
+        ax.set_yticks(ys)
+        ax.set_yticklabels(display_labels)
+        model_label = 'negative-binomial' if nb_result['model_family'] == 'negative_binomial' else 'Poisson, HC3-robust'
+        ax.set_xlabel(f'Metastatic-site rate ratio (95% CI)\n{model_label}, n={nb_result['n']}')
+        style_axis(ax)
+        handles = [mlines.Line2D([], [], color=COLOR_SIG, marker='o', linestyle='', label='P < 0.05'), mlines.Line2D([], [], color=COLOR_NS, marker='o', linestyle='', label='P >= 0.05')]
+        bottom_legend(fig, handles, [h.get_label() for h in handles])
+    else:
+        ax.axis('off')
+        ax.text(0.5, 0.5, 'Site-burden model\ndid not converge on this cohort', ha='center', va='center')
+    return finalize_figure(fig, output_dir, 'fig2_LMS_burden_by_HLA_status.png', dpi, overwrite, rect=(0, 0.05, 1, 1))
+
+def fig3_survival(surv_cohort: pd.DataFrame, cox_result: Optional[Dict], output_dir: Path, dpi: int, overwrite: bool) -> Path:
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
+    ax_km = axes[0]
+    panel_label(ax_km, 'a')
+    kmf = KaplanMeierFitter()
+    intact = surv_cohort[surv_cohort['HLA_I_LOH_STATUS'] == 'HLA-I intact']
+    loh = surv_cohort[surv_cohort['HLA_I_LOH_STATUS'] == 'HLA-I LOH']
+    linestyle = {'HLA-I intact': '-', 'HLA-I LOH': '--'}
+    for status, subset in [('HLA-I intact', intact), ('HLA-I LOH', loh)]:
+        if len(subset) < 5:
+            continue
+        kmf.fit(subset['OS_TIME'], subset['OS_EVENT'], label=f'{status} (n={len(subset)})')
+        kmf.plot_survival_function(ax=ax_km, ci_show=True, ci_alpha=0.15, color=PALETTE[status], linestyle=linestyle[status])
+    logrank_p = np.nan
+    if len(intact) >= 5 and len(loh) >= 5:
+        logrank_p = logrank_test(intact['OS_TIME'], loh['OS_TIME'], event_observed_A=intact['OS_EVENT'], event_observed_B=loh['OS_EVENT']).p_value
+    ax_km.set_xlabel('Overall survival (months)')
+    ax_km.set_ylabel('Survival probability')
+    ax_km.yaxis.set_major_formatter(PercentFormatter(xmax=1.0))
+    ax_km.text(0.98, 0.04, f'Log-rank P = {logrank_p:.3g}' if not np.isnan(logrank_p) else 'Log-rank P = NA', transform=ax_km.transAxes, ha='right', va='bottom', fontsize=9)
+    ax_km.get_legend().remove()
+    style_axis(ax_km)
+    handles = [mlines.Line2D([], [], color=c, linestyle=linestyle[s], label=s) for s, c in PALETTE.items()]
+    bottom_legend(fig, handles, [h.get_label() for h in handles])
+    ax_cox = axes[1]
+    panel_label(ax_cox, 'b')
+    if cox_result is not None:
+        color = COLOR_SIG if cox_result['p'] < 0.05 else COLOR_NS
+        ax_cox.errorbar([cox_result['HR']], [0], xerr=[[cox_result['HR'] - cox_result['HR_lo']], [cox_result['HR_hi'] - cox_result['HR']]], fmt='none', ecolor=color, capsize=4, zorder=1)
+        ax_cox.scatter([cox_result['HR']], [0], c=color, s=55, zorder=2)
+        ax_cox.axvline(1.0, color='grey', linestyle='--')
+        ax_cox.set_yticks([0])
+        ax_cox.set_yticklabels(['HLA-I LOH'])
+        ax_cox.set_xlabel(f'Adjusted hazard ratio (95% CI)\nrobust Cox, n={cox_result['n']}, events={cox_result['n_events']}, P = {cox_result['p']:.3g}')
+        ax_cox.set_ylim(-1, 1)
+        style_axis(ax_cox)
+    else:
+        ax_cox.axis('off')
+        ax_cox.text(0.5, 0.5, 'Cox model did not converge\n(insufficient n or events)', ha='center', va='center')
+    return finalize_figure(fig, output_dir, 'fig3_LMS_survival_by_HLA_status.png', dpi, overwrite, rect=(0, 0.06, 1, 1))
+
+def fig4_site_forest(site_model_table: pd.DataFrame, output_dir: Path, dpi: int, overwrite: bool) -> Optional[Path]:
+    modeled = site_model_table[site_model_table['MODELED']] if not site_model_table.empty else pd.DataFrame()
+    if modeled.empty:
+        logger.warning('No metastatic sites met the minimum-N threshold for regression modeling; skipping Figure 4.')
+        return None
+    modeled = modeled.sort_values('OR')
+    fig, ax = plt.subplots(figsize=(8, 1.6 + 0.6 * len(modeled)))
+    y = np.arange(len(modeled))
+    colors = [COLOR_SIG if q < 0.05 else COLOR_NS for q in modeled['FDR_Q']]
+    for xi, yi, loi, hii, ci in zip(modeled['OR'], y, modeled['OR_lo'], modeled['OR_hi'], colors):
+        ax.errorbar([xi], [yi], xerr=[[xi - loi], [hii - xi]], fmt='none', ecolor=ci, capsize=4, zorder=1)
+    ax.scatter(modeled['OR'], y, c=colors, s=55, zorder=2)
+    ax.axvline(1.0, color='grey', linestyle='--')
+    ax.set_yticks(y)
+    ax.set_yticklabels([f'{s} (n_pos={n})' for s, n in zip(modeled['SITE'], modeled['N_POSITIVE'])])
+    ax.set_xlabel('Adjusted odds ratio for HLA-I LOH (95% CI)\nlogistic, HC3-robust, adjusted for TMB/FGA/age/sex')
+    for i, (_, row) in enumerate(modeled.iterrows()):
+        ax.text(modeled['OR_hi'].max() * 1.05, i, f'q = {row['FDR_Q']:.3g}', va='center', fontsize=9)
+    style_axis(ax)
+    handles = [mlines.Line2D([], [], color=COLOR_SIG, marker='o', linestyle='', label='FDR q < 0.05'), mlines.Line2D([], [], color=COLOR_NS, marker='o', linestyle='', label='FDR q >= 0.05')]
+    bottom_legend(fig, handles, [h.get_label() for h in handles], y=-0.08)
+    return finalize_figure(fig, output_dir, 'fig4_LMS_site_specific_OR_forest.png', dpi, overwrite, rect=(0, 0.08, 1, 1))
+
+def supp_fig1_evaluability(index_samples: pd.DataFrame, cohort: pd.DataFrame, output_dir: Path, dpi: int, overwrite: bool) -> Path:
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    ax = axes[0]
+    panel_label(ax, 'a')
+    all_annotated = annotate_hla_loh(index_samples)
+    panel_eval = all_annotated.groupby('Gene Panel')['HLA_I_EVALUABLE'].agg(['sum', 'count']).sort_values('count', ascending=False)
+    x = np.arange(len(panel_eval))
+    pct = panel_eval['sum'] / panel_eval['count'] * 100
+    ax.bar(x, pct, color=COLOR_B, edgecolor='black')
+    for i, (_, row) in enumerate(panel_eval.iterrows()):
+        ax.text(i, pct.iloc[i] + 2, f'{int(row['sum'])}/{int(row['count'])}', ha='center', fontsize=9)
+    ax.set_xticks(x)
+    ax.set_xticklabels(panel_eval.index, fontsize=9)
+    ax.set_ylabel('HLA-I LOH evaluable (%)')
+    ax.set_xlabel('Assay panel')
+    ax.set_ylim(0, 110)
+    style_axis(ax)
+    ax = axes[1]
+    panel_label(ax, 'b')
+    n_total = len(index_samples)
+    checks = {'FACETS QC pass': (index_samples['FACETS QC'] == 'Pass').sum(), 'HLA-I evaluable': all_annotated['HLA_I_EVALUABLE'].sum(), 'Age/sex/FGA/TMB complete': index_samples[['Age at Diagnosis', 'Sex', 'Fraction Genome Altered', 'TMB Score']].notna().all(axis=1).sum(), 'Survival evaluable (OS_TIME>0)': (pd.to_numeric(index_samples['Overall Survival (Months)'], errors='coerce') > 0).sum()}
+    labels = list(checks.keys())
+    unevaluable_pct = [100 * (1 - checks[k] / n_total) for k in labels]
+    y = np.arange(len(labels))
+    ax.barh(y, unevaluable_pct, color=COLOR_NS, edgecolor='black')
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=9)
+    for i, pct_val in enumerate(unevaluable_pct):
+        ax.text(pct_val + 1, i, f'{pct_val:.1f}%', va='center', fontsize=9)
+    ax.set_xlabel(f'Missing or unevaluable (%, of {n_total} patients)')
+    style_axis(ax)
+    ax = axes[2]
+    panel_label(ax, 'c')
+    linestyle = {'HLA-I intact': '-', 'HLA-I LOH': '--'}
+    for status, color in PALETTE.items():
+        vals = cohort.loc[cohort['HLA_I_LOH_STATUS'] == status, 'FACETS Estimated Purity'].dropna()
+        if len(vals) < 2:
+            continue
+        vals.plot(kind='kde', ax=ax, color=color, linestyle=linestyle[status], label=f'{status} (n={len(vals)})')
+    ax.set_xlabel('FACETS tumour purity')
+    ax.set_xlim(0, 1)
+    style_axis(ax)
+    handles, labels_ = ax.get_legend_handles_labels()
+    bottom_legend(fig, handles, labels_)
+    return finalize_figure(fig, output_dir, 'supp_fig1_LMS_evaluability_QC.png', dpi, overwrite, rect=(0, 0.06, 1, 1))
+
+def supp_fig2_survival_diagnostics(surv_cohort: pd.DataFrame, output_dir: Path, dpi: int, overwrite: bool) -> Optional[Path]:
+    cph, cox_df = fit_cox(surv_cohort)
+    if cph is None:
+        logger.warning('Insufficient n for full Cox model; skipping Supplementary Figure 2.')
+        return None
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    terms = ['HLA_LOH_bin', 'FGA', 'TMB', 'AGE', 'SEX_bin']
+    labels = ['HLA-I LOH', 'FGA', 'TMB', 'Age', 'Female sex']
+    ax = axes[0]
+    panel_label(ax, 'a')
+    summary = cph.summary
+    hr = np.exp(summary.loc[terms, 'coef']).values
+    lo = np.exp(summary.loc[terms, 'coef lower 95%']).values
+    hi = np.exp(summary.loc[terms, 'coef upper 95%']).values
+    y = np.arange(len(terms))[::-1]
+    ax.errorbar(hr, y, xerr=[hr - lo, hi - hr], fmt='none', ecolor=COLOR_B, capsize=3, zorder=1)
+    ax.scatter(hr, y, c=COLOR_B, s=50, zorder=2)
+    ax.axvline(1.0, color='grey', linestyle='--')
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels)
+    ax.set_xlabel(f'Adjusted hazard ratio (95% CI)\nrobust Cox, n={len(cox_df)}, events={int(cox_df['OS_EVENT'].sum())}')
+    style_axis(ax)
+    ax = axes[1]
+    panel_label(ax, 'b')
+    ph_result = proportional_hazard_test(cph, cox_df, time_transform='rank')
+    ph_p = ph_result.summary['p']
+    display_terms = [t for t in terms if t in ph_p.index]
+    display_labels = [labels[terms.index(t)] for t in display_terms]
+    p_vals = ph_p.loc[display_terms].values
+    y2 = np.arange(len(display_terms))
+    ax.scatter(p_vals, y2, facecolors='none', edgecolors=COLOR_NS, s=55)
+    ax.axvline(0.05, color='red', linestyle='--', label='P = 0.05')
+    ax.set_yticks(y2)
+    ax.set_yticklabels(display_labels)
+    ax.set_xlim(0, 1)
+    ax.set_xlabel('Schoenfeld-residual test P value')
+    style_axis(ax)
+    ax.legend(fontsize=9, frameon=False, loc='lower right')
+    ax = axes[2]
+    panel_label(ax, 'c')
+    try:
+        clinical_df = cox_df[['OS_TIME', 'OS_EVENT', 'AGE', 'SEX_bin']].copy()
+        integrated_df = cox_df.copy()
+        scores_clin = k_fold_cross_validation(CoxPHFitter(), clinical_df, duration_col='OS_TIME', event_col='OS_EVENT', k=5, scoring_method='concordance_index')
+        scores_int = k_fold_cross_validation(CoxPHFitter(), integrated_df, duration_col='OS_TIME', event_col='OS_EVENT', k=5, scoring_method='concordance_index')
+        for i in range(len(scores_clin)):
+            ax.plot([0, 1], [scores_clin[i], scores_int[i]], color='grey', alpha=0.5, linewidth=1)
+        ax.scatter([0] * len(scores_clin), scores_clin, color=COLOR_A, marker='o', s=45, zorder=3)
+        ax.scatter([1] * len(scores_int), scores_int, color='#31a354', marker='^', s=45, zorder=3)
+        ax.plot([-0.12, 0.12], [np.mean(scores_clin)] * 2, color='black', linewidth=2)
+        ax.plot([0.88, 1.12], [np.mean(scores_int)] * 2, color='black', linewidth=2)
+        ax.set_xticks([0, 1])
+        ax.set_xticklabels(['Clinical\n(age+sex)', 'Integrated\n(+FGA+TMB+HLA-I LOH)'], fontsize=9)
+        ax.set_xlim(-0.4, 1.4)
+        ax.set_ylabel("Harrell's c-index")
+        style_axis(ax)
+    except Exception as exc:
+        logger.warning('Cross-validated c-index comparison failed: %s', exc)
+        ax.axis('off')
+        ax.text(0.5, 0.5, 'Cross-validation failed to run\non this cohort size', ha='center', va='center')
+    return finalize_figure(fig, output_dir, 'supp_fig2_LMS_survival_diagnostics.png', dpi, overwrite)
+ADJUSTMENT_SETS = {'Base (TMB+FGA+age+sex)': [], '+ assay panel': ['PANEL_468_bin'], '+ ancestry': ['NON_EUROPEAN_ANCESTRY_bin'], '+ specimen origin': ['MET_ORIGIN_bin'], '+ panel + ancestry': ['PANEL_468_bin', 'NON_EUROPEAN_ANCESTRY_bin'], 'Fully adjusted': ['PANEL_468_bin', 'NON_EUROPEAN_ANCESTRY_bin', 'MET_ORIGIN_bin']}
+
+def sensitivity_or_for_site(cohort: pd.DataFrame, site: str, extra_covariates: List[str]) -> Dict:
+    covariates = ['FGA', 'TMB', 'AGE', 'SEX_bin'] + extra_covariates
+    model_df = cohort.dropna(subset=['HLA_LOH_bin'] + covariates).copy()
+    model_df[f'has_{site}'] = model_df['RECORDED_METASTATIC_SITES'].apply(lambda lst: site in lst)
+    n_pos = int(model_df[f'has_{site}'].sum())
+    if n_pos < 5:
+        return {'OR': np.nan, 'OR_lo': np.nan, 'OR_hi': np.nan, 'P': np.nan, 'n': len(model_df), 'n_pos': n_pos, 'modeled': False}
+    formula = f'has_{site} ~ HLA_LOH_bin + ' + ' + '.join(covariates)
+    try:
+        logit = smf.glm(formula, data=model_df, family=sm.families.Binomial()).fit(cov_type='HC3')
+        beta, se, p = (logit.params['HLA_LOH_bin'], logit.bse['HLA_LOH_bin'], logit.pvalues['HLA_LOH_bin'])
+        return {'OR': float(np.exp(beta)), 'OR_lo': float(np.exp(beta - 1.96 * se)), 'OR_hi': float(np.exp(beta + 1.96 * se)), 'P': float(p), 'n': len(model_df), 'n_pos': n_pos, 'modeled': True}
+    except Exception as exc:
+        logger.warning('Sensitivity model failed for site=%s, covariates=%s: %s', site, extra_covariates, exc)
+        return {'OR': np.nan, 'OR_lo': np.nan, 'OR_hi': np.nan, 'P': np.nan, 'n': len(model_df), 'n_pos': n_pos, 'modeled': False}
+
+def supp_fig3_and_table3_sensitivity(cohort: pd.DataFrame, sites: List[str], output_dir: Path, dpi: int, overwrite: bool) -> Tuple[Optional[Path], pd.DataFrame]:
+    rows = []
+    for site in sites:
+        for adj_name, extra_covars in ADJUSTMENT_SETS.items():
+            rows.append({'Site': site, 'Adjustment': adj_name, **sensitivity_or_for_site(cohort, site, extra_covars)})
+    sens_table = pd.DataFrame(rows)
+    modeled_mask = sens_table['modeled']
+    sens_table['FDR_Q'] = np.nan
+    if modeled_mask.any():
+        sens_table.loc[modeled_mask, 'FDR_Q'] = multipletests(sens_table.loc[modeled_mask, 'P'], method='fdr_bh')[1]
+    note_rows = []
+    for site in sites:
+        excl_target = cohort[~cohort['RECORDED_METASTATIC_SITES'].apply(lambda lst: site in lst) | (cohort['SAMPLE_TYPE'] != 'Metastasis')]
+        n_pos_excl = int(excl_target['RECORDED_METASTATIC_SITES'].apply(lambda lst: site in lst).sum())
+        primary_only = cohort[cohort['SAMPLE_TYPE'] == 'Primary']
+        n_pos_primary = int(primary_only['RECORDED_METASTATIC_SITES'].apply(lambda lst: site in lst).sum())
+        for label, subset_n, n_pos in [('Target-site-biopsy-excluded (NOT MODELED)', len(excl_target), n_pos_excl), ('Primary-biopsy-only (NOT MODELED)', len(primary_only), n_pos_primary)]:
+            note_rows.append({'Site': site, 'Adjustment': label, 'n': subset_n, 'n_pos': n_pos, 'modeled': False, 'OR': np.nan, 'OR_lo': np.nan, 'OR_hi': np.nan, 'P': np.nan, 'FDR_Q': np.nan})
+    sens_table = pd.concat([sens_table, pd.DataFrame(note_rows)], ignore_index=True)
+    if not sites:
+        return (None, sens_table)
+    pivot = sens_table[sens_table['modeled']].pivot(index='Site', columns='Adjustment', values='OR').reindex(columns=list(ADJUSTMENT_SETS.keys()))
+    log2_or = np.log2(pivot.astype(float))
+    clip_bound = float(np.ceil(log2_or.abs().to_numpy().max() * 10) / 10) if log2_or.size else 1.0
+    log2_or_clipped = log2_or.clip(-clip_bound, clip_bound)
+    fig, ax = plt.subplots(figsize=(9, 2.0 + 0.6 * len(pivot)))
+    im = ax.imshow(log2_or_clipped.values, cmap=DIVERGING_CMAP, vmin=-clip_bound, vmax=clip_bound, aspect='auto')
+    ax.set_xticks(range(len(pivot.columns)))
+    ax.set_xticklabels(pivot.columns, rotation=30, ha='right', fontsize=9)
+    ax.set_yticks(range(len(pivot.index)))
+    ax.set_yticklabels(pivot.index)
+    ax.set_xticks(np.arange(-0.5, len(pivot.columns), 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, len(pivot.index), 1), minor=True)
+    ax.grid(which='minor', color='white', linewidth=1.5)
+    ax.tick_params(which='minor', size=0)
+    q_lookup = sens_table[sens_table['modeled']].set_index(['Site', 'Adjustment'])['FDR_Q']
+    for i, site in enumerate(pivot.index):
+        for j, adj in enumerate(pivot.columns):
+            q = q_lookup.get((site, adj), np.nan)
+            if pd.notna(q) and q < 0.05:
+                ax.scatter([j], [i], marker='o', color='white', s=25, edgecolors='none')
+    cbar = fig.colorbar(im, ax=ax, orientation='horizontal', pad=0.35, shrink=0.6)
+    cbar.set_label('log2(OR)')
+    fig_path = finalize_figure(fig, output_dir, 'supp_fig3_LMS_site_sensitivity_heatmap.png', dpi, overwrite)
+    return (fig_path, sens_table)
+
+def supp_fig4_paired_primary_met(raw: pd.DataFrame, output_dir: Path, dpi: int, overwrite: bool) -> Tuple[Optional[Path], Optional[pd.DataFrame]]:
+    lms = raw[raw['Cancer Type Detailed'] == 'Leiomyosarcoma'].copy()
+    by_patient = lms.groupby('Patient ID')['Sample Type'].apply(set)
+    eligible_patients = by_patient[by_patient.apply(lambda s: 'Primary' in s and 'Metastasis' in s)].index.tolist()
+    if len(eligible_patients) < 3:
+        logger.warning('Fewer than 3 patients with paired primary+metastasis samples; skipping Supplementary Figure 4.')
+        return (None, None)
+    pairs = []
+    for pid in eligible_patients:
+        pdata = lms[lms['Patient ID'] == pid]
+        prim = pdata[pdata['Sample Type'] == 'Primary'].iloc[0]
+        met = pdata[pdata['Sample Type'] == 'Metastasis'].iloc[0]
+        pairs.append({'Patient ID': pid, 'TMB_primary': prim['TMB Score'], 'TMB_metastasis': met['TMB Score'], 'FGA_primary': prim['Fraction Genome Altered'], 'FGA_metastasis': met['Fraction Genome Altered'], 'MutCount_primary': prim['Mutation Count'], 'MutCount_metastasis': met['Mutation Count']})
+    paired_df = pd.DataFrame(pairs)
+    fig, axes = plt.subplots(1, 3, figsize=(14, 5))
+    for ax, letter, var, label in zip(axes, ['a', 'b', 'c'], ['TMB', 'FGA', 'MutCount'], ['TMB (mutations per Mb)', 'FGA', 'Mutation count']):
+        panel_label(ax, letter)
+        prim_col, met_col = (f'{var}_primary', f'{var}_metastasis')
+        sub = paired_df.dropna(subset=[prim_col, met_col])
+        for _, row in sub.iterrows():
+            ax.plot([0, 1], [row[prim_col], row[met_col]], color='grey', alpha=0.5, linewidth=1, zorder=1)
+        ax.scatter([0] * len(sub), sub[prim_col], color=COLOR_PRIMARY, s=45, zorder=2)
+        ax.scatter([1] * len(sub), sub[met_col], color=COLOR_METASTASIS, s=45, zorder=2)
+        ax.set_xticks([0, 1])
+        ax.set_xticklabels(['Primary', 'Metastasis'])
+        ax.set_ylabel(label)
+        if len(sub) >= 3:
+            _, p = wilcoxon(sub[prim_col], sub[met_col])
+            ax.text(0.5, 1.02, f'Wilcoxon P = {p:.3g} (n = {len(sub)} pairs)', transform=ax.transAxes, ha='center', fontsize=9)
+        else:
+            ax.text(0.5, 1.02, f'n = {len(sub)} pairs -- too few to test', transform=ax.transAxes, ha='center', fontsize=9)
+        style_axis(ax)
+    handles = [mlines.Line2D([], [], color=COLOR_PRIMARY, marker='o', linestyle='', label='Primary'), mlines.Line2D([], [], color=COLOR_METASTASIS, marker='o', linestyle='', label='Metastasis')]
+    bottom_legend(fig, handles, [h.get_label() for h in handles])
+    fig_path = finalize_figure(fig, output_dir, 'supp_fig4_LMS_paired_primary_metastasis.png', dpi, overwrite, rect=(0, 0.06, 1, 0.96))
+    return (fig_path, paired_df)
+
+def supp_table1_extended_burden_model(cohort: pd.DataFrame) -> pd.DataFrame:
+    extra = ['MET_ORIGIN_bin', 'PANEL_468_bin', 'NON_EUROPEAN_ANCESTRY_bin']
+    result = site_burden_model(cohort, extra_covariates=extra)
+    labels = {'HLA_LOH_bin': 'HLA-I loss of heterozygosity', 'TMB': 'TMB (per unit, mutations/Mb)', 'FGA': 'FGA (per unit)', 'AGE': 'Age (per year)', 'SEX_bin': 'Female sex', 'MET_ORIGIN_bin': 'Metastatic-origin specimen', 'PANEL_468_bin': 'IMPACT468 panel', 'NON_EUROPEAN_ANCESTRY_bin': 'Non-European genetic ancestry'}
+    rows = []
+    for term in result['terms']:
+        rr, lo, hi, p = (result[f'{term}_RR'], result[f'{term}_RR_lo'], result[f'{term}_RR_hi'], result[f'{term}_p'])
+        rows.append({'Predictor': labels.get(term, term), 'RR (95% CI)': f'{rr:.2f} ({lo:.2f}-{hi:.2f})', 'P': p, 'n': result['n']})
+    return pd.DataFrame(rows)
+
+def supp_table2_bone_not_modeled(cohort: pd.DataFrame, min_site_n: int) -> pd.DataFrame:
+    n_bone = int(cohort['RECORDED_METASTATIC_SITES'].apply(lambda lst: 'Bone' in lst).sum())
+    return pd.DataFrame([{'Site': 'Bone', 'N_positive': n_bone, 'N_total': len(cohort), 'Minimum_N_required_to_model': min_site_n, 'Status': 'NOT MODELED', 'Reason': f'Only {n_bone} of {len(cohort)} analysis-cohort patients have a recorded bone metastasis (below the pre-specified minimum of {min_site_n} positive patients). Fitting a logistic model here would produce an unstable, uninterpretable estimate; reporting only the raw count preserves integrity.'}])
+
+def supp_table4_driver_interactions_not_producible() -> pd.DataFrame:
+    return pd.DataFrame([{'Table': 'Supplementary Table 4 (driver-specific HLA-I LOH burden interactions)', 'Status': 'NOT PRODUCIBLE', 'Reason': 'This MSK-IMPACT leiomyosarcoma clinical export contains no per-gene mutation-call columns (no TP53/KRAS/EGFR or equivalent driver-alteration fields). Reproducing this table would require fabricating gene-level calls, which this pipeline will not do. If a genomics MAF/mutation file for this cohort becomes available, this table can be built from real per-gene calls.'}])
+
+def supp_table5_survival_interactions(surv_cohort: pd.DataFrame) -> pd.DataFrame:
+    df = surv_cohort.dropna(subset=['OS_TIME', 'OS_EVENT', 'HLA_LOH_bin', 'FGA', 'TMB', 'AGE', 'SEX_bin', 'N_RECORDED_METASTATIC_SITES']).copy()
+    if len(df) < 20:
+        return pd.DataFrame()
+    interactions = {'HLA-I LOH x metastatic-site burden': 'N_RECORDED_METASTATIC_SITES', 'HLA-I LOH x FGA': 'FGA', 'HLA-I LOH x TMB': 'TMB'}
+    rows = []
+    for label, covar in interactions.items():
+        cox_df = df[['OS_TIME', 'OS_EVENT', 'HLA_LOH_bin', 'FGA', 'TMB', 'AGE', 'SEX_bin', 'N_RECORDED_METASTATIC_SITES']].copy()
+        cox_df['INTERACTION'] = cox_df['HLA_LOH_bin'] * cox_df[covar]
+        try:
+            cph = CoxPHFitter()
+            cph.fit(cox_df, duration_col='OS_TIME', event_col='OS_EVENT', robust=True)
+            s = cph.summary
+            beta, lo_c, hi_c, p = (s.loc['INTERACTION', 'coef'], s.loc['INTERACTION', 'coef lower 95%'], s.loc['INTERACTION', 'coef upper 95%'], s.loc['INTERACTION', 'p'])
+            rows.append({'Interaction': label, 'RHR (95% CI)': f'{np.exp(beta):.2f} ({np.exp(lo_c):.2f}-{np.exp(hi_c):.2f})', 'P': float(p), 'n': int(len(cox_df)), 'Events': int(cox_df['OS_EVENT'].sum())})
+        except Exception as exc:
+            logger.warning('Survival interaction model failed for %s: %s', label, exc)
+            rows.append({'Interaction': label, 'RHR (95% CI)': 'NA', 'P': np.nan, 'n': int(len(cox_df)), 'Events': int(cox_df['OS_EVENT'].sum())})
+    table = pd.DataFrame(rows)
+    valid = table['P'].notna()
+    table['FDR_Q'] = np.nan
+    if valid.any():
+        table.loc[valid, 'FDR_Q'] = multipletests(table.loc[valid, 'P'], method='fdr_bh')[1]
+    return table
+
+def main() -> None:
+    args = parse_args()
+    output_dir = Path(args.output_dir).resolve()
+    ensure_dir(output_dir)
+    logger.info('Starting LMS HLA-I LOH display-item pipeline (real-data only)')
+    raw = load_raw(Path(args.input_tsv))
+    index_samples, flow = build_patient_level_cohort(raw)
+    cohort, flow = build_analysis_cohort(index_samples, flow)
+    surv_cohort = build_survival_subset(cohort, flow)
+    cohort = prep_model_columns(cohort)
+    surv_cohort = prep_model_columns(surv_cohort)
+    save_csv(build_table1(cohort), output_dir, 'LMS_table1_characteristics.csv', args.overwrite)
+    table2, site_freq_table, site_model_table = build_table2(cohort, surv_cohort, args.min_site_n)
+    save_csv(table2, output_dir, 'LMS_table2_hypothesis_tests.csv', args.overwrite)
+    save_csv(site_freq_table, output_dir, 'LMS_metastatic_site_frequencies_ALL_SITES.csv', args.overwrite)
+    if not site_model_table.empty:
+        save_csv(site_model_table, output_dir, 'LMS_site_specific_logistic_models.csv', args.overwrite)
+    save_csv(cohort.drop(columns=['RECORDED_METASTATIC_SITES']), output_dir, 'LMS_analysis_cohort.csv', args.overwrite)
+    nb_result = site_burden_model(cohort)
+    cph, cox_df = fit_cox(surv_cohort)
+    cox_result = cox_summary_dict(cph, cox_df) if cph is not None else None
+    fig1_cohort_and_sites(cohort, flow, site_freq_table, output_dir, args.dpi, args.overwrite)
+    fig2_burden_boxplots(cohort, nb_result, output_dir, args.dpi, args.overwrite)
+    fig3_survival(surv_cohort, cox_result, output_dir, args.dpi, args.overwrite)
+    fig4_site_forest(site_model_table, output_dir, args.dpi, args.overwrite)
+    supp_fig1_evaluability(index_samples, cohort, output_dir, args.dpi, args.overwrite)
+    supp_fig2_survival_diagnostics(surv_cohort, output_dir, args.dpi, args.overwrite)
+    site_freq_all = cohort['RECORDED_METASTATIC_SITES'].explode().value_counts()
+    sites_for_sensitivity = site_freq_all[site_freq_all >= args.min_site_n].index.tolist()
+    logger.info('Sites meeting min-N=%d for sensitivity analysis: %s', args.min_site_n, sites_for_sensitivity)
+    _, sens_table = supp_fig3_and_table3_sensitivity(cohort, sites_for_sensitivity, output_dir, args.dpi, args.overwrite)
+    save_csv(sens_table, output_dir, 'supp_LMS_table3_site_sensitivity.csv', args.overwrite)
+    _, paired_df = supp_fig4_paired_primary_met(raw, output_dir, args.dpi, args.overwrite)
+    if paired_df is not None:
+        save_csv(paired_df, output_dir, 'supp_LMS_paired_primary_metastasis_data.csv', args.overwrite)
+    save_csv(supp_table1_extended_burden_model(cohort), output_dir, 'supp_LMS_table1_extended_burden_model.csv', args.overwrite)
+    save_csv(supp_table2_bone_not_modeled(cohort, args.min_site_n), output_dir, 'supp_LMS_table2_bone_not_modeled.csv', args.overwrite)
+    save_csv(supp_table4_driver_interactions_not_producible(), output_dir, 'supp_LMS_table4_driver_interactions_NOT_PRODUCIBLE.csv', args.overwrite)
+    table5 = supp_table5_survival_interactions(surv_cohort)
+    if not table5.empty:
+        save_csv(table5, output_dir, 'supp_LMS_table5_survival_interactions.csv', args.overwrite)
+    metadata = {'program_version': PROGRAM_VERSION, 'input_file': str(args.input_tsv), 'min_site_n_to_model': args.min_site_n, 'cohort_flow': flow, 'sites_sensitivity_tested': sites_for_sensitivity, 'notes': ['All statistics are computed directly from the real MSK-IMPACT leiomyosarcoma clinical export. No per-gene driver mutation data exists in this file, so no driver-interaction analyses were attempted (see Supplementary Table 4).', f'Metastatic sites with fewer than {args.min_site_n} positive patients are reported as raw counts only (Figure 1 / Table 2) and are excluded from any regression/OR table.', 'Supplementary Table 2 (bone) is reported as NOT MODELED with the real raw count because only a handful of patients in this cohort have a recorded bone metastasis.', "Supplementary Figure/Table 3 could only be run for the 'all mapped' population: in this dataset, 'Metastatic Site' is populated almost exclusively for the sequenced specimen itself, so the target-site-biopsy-excluded and primary-biopsy-only populations from the reference paper have ~0 positive cases for Lung/Liver and are documented as not analyzable rather than modeled."]}
+    save_json(metadata, output_dir, 'LMS_run_metadata.json', args.overwrite)
+    logger.info('Done. Analysis cohort n=%d, survival cohort n=%d. Outputs: %s', len(cohort), len(surv_cohort), output_dir)
+if __name__ == '__main__':
+    main()
